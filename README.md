@@ -49,14 +49,18 @@ left as they are.
   that chains OOM → UAF → forged `zend_array` → `system()` call never
   produced observable code execution in this environment.
 
-- **The blocking issue is identified and measured, not an unknown.** After the
-  OOM, the dangling array keeps `pDestructor == zval_ptr_dtor` (**not**
-  `zif_system`) and `nTableSize == 8`: the destructor pointer and the table
-  size survive intact, while the refcount and the flags are garbage. Two
-  requirements remain: (a) that a 56-byte allocation lands exactly on the
-  freed slot — reachable with spray, not with exact control — and (b) that
-  this allocation writes `zif_system` at offset `0x30` while keeping a valid
-  hash table with an `IS_STRING` bucket. See **§10.11-bis** of the article.
+- **The blocking issue is identified and measured, not an unknown.** The raw
+  memory dump of the dangling array (§10.11-ter) shows that its last 24 bytes
+  were overwritten by the allocator: `pDestructor` holds `arr + 0x50` and
+  `arData` holds `arr + 0x30` — **self-referential garbage, not function
+  pointers**. An earlier version of this README claimed that `pDestructor`
+  kept `zval_ptr_dtor`; that was an inference and the measurement refuted
+  it. The missing requirements are (a) that a 56-byte allocation lands
+  exactly on the freed slot — reachable with spray, not with exact control —
+  and (b) that this allocation **rebuilds** both the `pDestructor` at offset
+  `0x30` and a valid `arData` at offset `0x10` with its bucket table and an
+  `IS_STRING` bucket. See **§10.11-bis** and **§10.11-ter** of the article,
+  and the raw logs under `evidence/`.
 
 - **Therefore `php2shell_rce.py` and `php2shell_rce_exploit.py` are research
   scaffolding, not functional exploits.** Do not treat them as weaponizable.
@@ -238,10 +242,12 @@ python3 php2shell_rce_exploit.py run --port 8084
 
 > ⚠️ **This is not a working exploit.** The RCE was not achieved. What the
 > attempt does establish is precisely what is still missing: after the OOM,
-> the dangling array still carries `pDestructor == zval_ptr_dtor`, so the
-> remaining requirement is to overwrite offset `0x30` of the freed 56-byte
-> slot with the address of `zif_system` while keeping the structure a valid
-> hash table with one `IS_STRING` bucket holding the command.
+> the dangling array's `pDestructor` does not even hold a function pointer:
+> the raw dump (§10.11-ter) shows `arr + 0x50` there, i.e. self-referential
+> garbage, with `arData` equally corrupted at `arr + 0x30`. The remaining
+> requirement is therefore to land a 56-byte allocation in that exact slot
+> that rebuilds **both** the `pDestructor` at offset `0x30` and a valid
+> `arData` at offset `0x10` with an `IS_STRING` bucket holding the command.
 
 The gadget contract is real and verified in the source:
 

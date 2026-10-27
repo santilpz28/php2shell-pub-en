@@ -1010,7 +1010,7 @@ The values of the freed state are the classic signature:
 | `flags` | `0x8` | `0x0` | flags stomped by the reassignment |
 | `nNumUsed` | 0 | 1 | reused bucket |
 | `nTableSize` | 8 | 8 | survives: that is why the crash is late |
-| `pDestructor` | `zval_ptr_dtor` | `zval_ptr_dtor` | survives intact |
+| `pDestructor` | `zval_ptr_dtor` | `arr + 0x50` | **garbage** (see §10.11-ter) |
 
 That `nTableSize` and `pDestructor` survive intact explains the failure
 window: the corruption is not total. The `gc.refcount` blown up to
@@ -1398,9 +1398,13 @@ if (ht->nNumUsed) {                              /* <- only if there are buckets
 }
 ```
 
-In the measured dangling array, `nNumUsed = 0`: the `pDestructor` **never
-gets invoked** and the crash comes from corrupted `arData`. Forging the
-gadget must additionally produce an array with at least one occupied bucket.
+In the measured dangling array, the `pDestructor` **never gets invoked** and
+the crash comes from corrupted `arData`. The raw dump (§10.11-ter) shows
+`nNumUsed = 1` at the moment `php_session_rfc1867_cleanup()` reads the
+array, but `arData` holds `arr + 0x30` — self-referential garbage — so the
+bucket table is not addressable and the destructor is never reached
+through it. Forging the gadget must additionally produce an array with at
+least one occupied bucket **and** a valid `arData` pointing at it.
 
 The exact point where this fits is in `php_session_track_init()`
 (`ext/session/session.c`):
@@ -1413,7 +1417,10 @@ array_init(&session_vars);                   /* emalloc(56) */
 ```
 
 **What was measured in the instrumented binary:** after the OOM, the dangling
-array **preserves** `pDestructor == zval_ptr_dtor` and `nTableSize == 8`.
+array keeps `nTableSize == 8` and the first 48 bytes standing, but
+**`pDestructor` does NOT preserve `zval_ptr_dtor`**: the raw memory dump
+(§10.11-ter) shows it holds `arr + 0x50`, i.e. self-referential garbage.
+The same happens with `arData`, which holds `arr + 0x30`.
 The corruption is partial: the refcount and the flags are garbage, but the
 pointer to the destructor and the table size survive intact.
 
@@ -1427,7 +1434,8 @@ That defines exactly what is missing:
 | The slot's `pDestructor` is an invocable gadget | ❌ **it is still `zval_ptr_dtor`** |
 | The gadget has a `void f(void *)` compatible signature | ⚠️ **`zif_system` is NOT** (two-argument signature) |
 | An `IS_STRING` bucket with the command | ❌ not reached |
-| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
+| The dangling array has `nNumUsed >= 1` | ✅ measured `nNumUsed = 1` in the raw dump |
+| The slot's `arData` points to a valid bucket table | ❌ **it holds `arr + 0x30` (self-referential garbage)** |
 
 **The requirements that block the RCE are the fourth, the fifth and the
 seventh.** Three things are needed at once:
@@ -1491,6 +1499,98 @@ required pointer precision was not modelled. The
 `php2shell_rce_exploit.py` image executes the real scenario and reports the
 state of the gadget on every attempt, so progress is measurable, but it
 **does not produce code execution**.
+
+### 10.11-ter The raw dump: why the `pDestructor` does NOT survive
+
+The previous section took for granted that the `pDestructor` of the dangling
+array was still `zval_ptr_dtor`. In order to check it instead of assuming it,
+`php_session_rfc1867_cleanup()` was instrumented with a dump of the 8 raw
+bytes of the `zend_array` at the exact instant it is read.
+
+**Method.** In the `CLEANUP` trace block the following was added:
+
+```c
+unsigned long *w = (unsigned long *)arr;
+for (int i = 0; i < 8; i++) {
+    fprintf(pf, "  +0x%02zx = 0x%016lx\n", (unsigned)(i*8), (unsigned long)w[i]);
+}
+```
+
+The module was compiled and loaded with `MaxRequestWorkers 1` (same mandatory
+worker) and ASLR active, reading the base of the mapping from
+`/proc/<pid>/maps` in order to resolve the symbols.
+
+**Result (real run, raw logs in `evidence/`):**
+
+```
+PEEK2 arr=0x728fa6655310 ps_vars=0x728fa5823760
+  +0x00 = 0x0000000700000001
+  +0x08 = 0xfffffff000000000
+  +0x10 = 0x0000728fa6655340
+  +0x18 = 0x0000000100000001
+  +0x20 = 0x0000000000000008
+  +0x28 = 0x8000000000000000
+  +0x30 = 0x0000728fa6655360
+  +0x38 = 0x0000728fa6655380
+```
+
+With base `0x728fa4a87000`:
+
+- `zval_ptr_dtor` → `0x728fa4e60950` (offset `0x3d9950`)
+- `zif_system` → `0x728fa4d94560` (offset `0x30d560`)
+
+**Field-by-field interpretation:**
+
+| Offset | Field | Observed value | Reading |
+|---|---|---|---|
+| 0x00 | `gc.refcount` | 1 | intact |
+| 0x08 | `u.flags` | 0x07 | intact |
+| 0x0C | `nTableMask` | 0xfffffff0 | intact |
+| 0x10 | **`arData`** | **`arr + 0x30`** | **self-referential garbage** |
+| 0x18 | `nNumUsed` / `nNumOfElements` | 1 / 1 | intact |
+| 0x20 | `nTableSize` | 8 | intact |
+| 0x28 | `nNextFreeElement` | 0x8000000000000000 | intact |
+| 0x30 | **`pDestructor`** | **`arr + 0x50`** | **garbage, NOT `zval_ptr_dtor`** |
+| 0x38 | (outside the array) | `arr + 0x70` | — |
+
+**What this corrects.** The `pDestructor` of the dangling array is **not**
+`zval_ptr_dtor` nor any other function: it is a pointer that points to
+`arr + 0x50`, that is, to a field of the array itself. And `arData` —the
+pointer to the bucket table— equals `arr + 0x30`, also garbage.
+
+This is the signature of a **reused** slot: the allocator colonized the
+56-byte block with a pattern of self-referential pointers. The
+`arr+0x30` / `arr+0x50` / `arr+0x70` pattern is a regular progression with a
+`0x20` step, typical of an allocator that chains free blocks.
+
+**Consequence for the RCE — it is worse than was supposed.** The previous
+hypothesis was "the `pDestructor` survives, it is only necessary to replace it
+with `zif_system`". The measured reality is that:
+
+1. The `pDestructor` field has to be **rebuilt** entirely, not replaced.
+2. The `arData` field is also garbage: without a valid bucket table there is
+   no `zval` to which to pass the command, so
+   `ht->pDestructor(&p->val)` has nowhere to read the command from.
+3. That is to say: **a single 8-byte write into the slot is not enough.** It
+   is necessary that a 56-byte allocation lands in that exact position *and*
+   that it has the correct content at offsets `0x10` and `0x30` at the same
+   time.
+
+This **confirms** the size-class diagnosis (bin 6) and **reinforces** the
+conclusion that the classic 288 B spray of the writeups cannot serve: neither
+by size class, nor by content.
+
+**The point that remains open:** is it possible that a 56 B allocation with
+attacker-chosen content lands in that slot with a 28.4 % probability per
+attempt? That is the question that remains open, and the answer is what
+separates this investigation from a functional exploit.
+
+**Methodological note.** This finding is the main argument for
+instrumenting the binary instead of reasoning about the code: the inference
+"the pointer to the destructor survives" was plausible, well-reasoned,
+consistent with the model of the official advisory — and **false**. The 64-byte
+dump refuted it in one minute. A reader who trusted the reading of the
+article instead of the dump would have built the PoC on a broken premise.
 
 ### 10.12 Validation against the official advisory (`GHSA-6wmf-4rv5-p3rp`)
 

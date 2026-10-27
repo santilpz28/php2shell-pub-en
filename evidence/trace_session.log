@@ -1,0 +1,9 @@
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+TRACK_INIT arr=0x728fa6655310 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
+CLEANUP ps_http_session_vars=0x728fa5823760 arr=0x728fa6655310 gc=1 flags=0x0 nTableSize=8 nNumUsed=1 arData=0x728fa6655340 pDestructor=0x728fa6655360
+TRACK_INIT arr=0x728fa66542d8 gc=1 flags=0x8 nTableMask=0xfffffffe arData=0x728fa56dd7c8 nNumUsed=0 nNumOfElements=0 nTableSize=8 nInternalPointer=0 nNextFreeElement=-9223372036854775808 pDestructor=0x728fa4e60950 sizeof=56
