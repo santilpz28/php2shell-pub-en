@@ -1261,6 +1261,78 @@ allocation and every free of bin 6.
 
 ---
 
+### 10.11-bis The RCE escalation attempt: what was measured and what is missing
+
+With the UAF mechanism verified and the gadget located in the source code,
+the primitive can be stated precisely:
+
+```c
+/* Zend/zend_types.h:104 */
+typedef void (*dtor_func_t)(zval *pDest);
+
+/* Zend/zend_hash.c:1701 — the call */
+ht->pDestructor(&p->val);
+
+/* Zend/zend_hash.c:1757 — the condition */
+if (UNEXPECTED(ht->pDestructor != ZVAL_PTR_DTOR)) {
+    zend_hash_destroy(ht);
+    goto free_ht;
+}
+```
+
+`ZEND_FUNCTION(system)` has the signature `void system(zval *, ...)`, compatible
+with `dtor_func_t`. Therefore: **if the freed `zend_array` carries
+`pDestructor == zif_system` and one of its buckets contains a `zval` of type
+`IS_STRING`, the destructor call becomes `system(&bucket.val)`,
+and the string is the command.**
+
+The exact point where this fits is in `php_session_track_init()`
+(`ext/session/session.c`):
+
+```c
+if (!Z_ISUNDEF(PS(http_session_vars))) {
+    zval_ptr_dtor(&PS(http_session_vars));   /* destroys the DANGLING array */
+}
+array_init(&session_vars);                   /* emalloc(56) */
+```
+
+**What was measured in the instrumented binary:** after the OOM, the dangling
+array **preserves** `pDestructor == zval_ptr_dtor` and `nTableSize == 8`.
+The corruption is partial: the refcount and the flags are garbage, but the
+pointer to the destructor and the table size survive intact.
+
+That defines exactly what is missing:
+
+| Requirement | Status |
+|---|---|
+| The freed `zend_array` is 56 bytes (bin 6) | ✅ measured |
+| The slot position in the pool is predictable | ✅ measured (element 14, step 0x38) |
+| The next 56 B allocation reuses it | ⚠️ 28,4 % per attempt (LIFO, per page) |
+| The slot's `pDestructor` is `zif_system` | ❌ **it is still `zval_ptr_dtor`** |
+| An `IS_STRING` bucket with the command | ❌ not reached |
+
+**The requirement that blocks the RCE is the fourth one.** To achieve it, two
+things are needed at the same time:
+
+1. For a 56-byte allocation to land **exactly** in the freed slot.
+   This is an allocator control problem, and the 28,4 % per attempt makes it
+   reachable with several attempts — but with a spray, not with exact control.
+2. For that allocation to write `zif_system` at offset `0x30` of the slot
+   while keeping the rest of the structure as a valid hash table with an
+   `IS_STRING` bucket.
+
+Point 2 is the hard one, because a forged `zend_array` cannot carry the
+command inside itself: 56 bytes do not allow for more. The command has to live
+in another allocation — a `zend_string` — that the bucket points to.
+
+**What was NOT done and why it is not claimed:** a 56-byte allocation with
+attacker-chosen content was not built. The classic 288-byte spray from the
+writeups does not work (§10.6), and in this work a 56-byte spray with the
+required pointer precision was not modelled. The
+`php2shell_rce_exploit.py` image executes the real scenario and reports the
+state of the gadget on every attempt, so progress is measurable, but it
+**does not produce code execution**.
+
 ### 10.12 Validation against the official advisory (`GHSA-6wmf-4rv5-p3rp`)
 
 On 21 October, the PHP project published the advisory

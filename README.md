@@ -114,7 +114,8 @@ problem.
 | `behavioural_diff.py` | Differential vulnerable/patched test with A/B controls |
 | `php2shell_leak.py` | UAF detector with negative controls |
 | `php2shell_rce.py` | Escalation scaffold: mounts the real scenario and collects the trace |
-| `patches/` | Idempotent patches that instrument PHP itself (session + allocator + dtor) |
+| `php2shell_rce_exploit.py` | The RCE attempt: drives the scenario and reports whether the `pDestructor == zif_system` gadget is in place |
+| `patches/` | Idempotent patches that instrument PHP itself (session + allocator + dtor site) |
 | `web/` | Lab endpoints |
 
 ### Quick start
@@ -146,6 +147,33 @@ python3 php2shell_rce.py probe --port 8084 --records 1500
 docker exec php2shell-trace cat /tmp/php2shell_trace.log   # session
 docker exec php2shell-trace cat /tmp/php2shell_alloc.log   # allocator
 docker exec php2shell-trace cat /tmp/php2shell_dtor.log    # dtor
+```
+
+### The RCE attempt
+
+```bash
+# Measured layout: where the gadget field is, and which size class matters
+python3 php2shell_rce_exploit.py layout
+
+# Drive the real OOM -> Request B scenario and check the gadget
+python3 php2shell_rce_exploit.py run --port 8084
+```
+
+> ⚠️ **This is not a working exploit.** The RCE was not achieved. What the
+> attempt does establish is precisely what is still missing: after the OOM,
+> the dangling array still carries `pDestructor == zval_ptr_dtor`, so the
+> remaining requirement is to overwrite offset `0x30` of the freed 56-byte
+> slot with the address of `zif_system` while keeping the structure a valid
+> hash table with one `IS_STRING` bucket holding the command.
+
+The gadget contract is real and verified in the source:
+
+```c
+typedef void (*dtor_func_t)(zval *pDest);   /* matches ZEND_FUNCTION(system) */
+
+Zend/zend_hash.c:1701   ht->pDestructor(&p->val);
+Zend/zend_hash.c:1757   if (ht->pDestructor != ZVAL_PTR_DTOR)
+                            zend_hash_destroy(ht);
 ```
 
 The patches are applied **before compiling** and are idempotent: the target is
