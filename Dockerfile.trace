@@ -45,11 +45,14 @@ RUN ln -sf /usr/sbin/a2enmod /usr/bin/a2enmod \
 # ---------------------------------------------------------------------------
 COPY patches/apply_trace_patch.py /build/apply_trace_patch.py
 COPY patches/apply_alloc_trace_patch.py /build/apply_alloc_trace_patch.py
+COPY patches/apply_dtor_trace_patch.py /build/apply_dtor_trace_patch.py
 RUN tar xzf php-8.2.34.tar.gz && cd php-8.2.34 && \
     python3 /build/apply_trace_patch.py ext/session/session.c && \
     python3 /build/apply_alloc_trace_patch.py Zend/zend_alloc.c && \
+    python3 /build/apply_dtor_trace_patch.py ext/session/session.c && \
     grep -c "PHP2SHELL_TRACE\|PHP2SHELL_FREE" ext/session/session.c && \
     grep -c "PHP2SHELL_ALLOC" Zend/zend_alloc.c && \
+    grep -c "PHP2SHELL_DTOR" ext/session/session.c && \
     echo "PATCHES APLICADOS OK"
 
 # Build conjunto de PHP CLI + mod_php con simbolos.
@@ -148,7 +151,7 @@ RUN a2dismod mpm_event mpm_worker 2>/dev/null || true; \
     mkdir -p /var/www/html
 
 # El directorio de la traza debe existir y ser escribible por www-data.
-RUN mkdir -p /tmp/php2shell && touch /tmp/php2shell_trace.log /tmp/php2shell_alloc.log && \
-    chmod 666 /tmp/php2shell_trace.log /tmp/php2shell_alloc.log
+RUN mkdir -p /tmp/php2shell && touch /tmp/php2shell_trace.log /tmp/php2shell_alloc.log /tmp/php2shell_dtor.log && \
+    chmod 666 /tmp/php2shell_trace.log /tmp/php2shell_alloc.log /tmp/php2shell_dtor.log
 
 CMD ["/usr/local/bin/apache2-noraslr"]

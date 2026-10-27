@@ -14,6 +14,76 @@
 
 ---
 
+## ⚠️ Status disclaimer — read before using this repository
+
+This disclaimer was added **at the end of the work** so that nobody mistakes
+"published code" for "verified exploitation chain". It does not imply that the
+rest of the material was modified: the article, the PoCs and the scripts are
+left as they are.
+
+### What is verified end to end
+
+| Artifact | Status |
+|---|---|
+| Analysis of the PHP 8.2.34 source code (`ext/session/session.c`) | ✅ Verified directly |
+| Reading and cross-checking the official patch `31c0ea7d7ff` | ✅ Verified directly |
+| Layout of `zend_internal_function` (size=136, `handler` at offset 72) | ✅ Verified with an `offsetof` program against `Zend/zend_compile.h` |
+| Vulnerable/patched differential test (`behavioural_diff.py`) | ✅ Executed against real 8.2.34 and 8.2.35 |
+| UAF mechanism with real addresses and real slot size | ✅ Measured in the instrumented binary |
+| Size of the freed `zend_array` (56 B, bin 6) and its position in the pool (element 14, step 0x38) | ✅ Measured |
+| Reuse of the freed slot by the next 56-byte allocation | ⚠️ 28.4 % per attempt (LIFO, per-page) |
+| Mapping against the official advisory `GHSA-6wmf-4rv5-p3rp` (producer/consumer) | ✅ Cross-checked point by point |
+| RCE PoC components (spray, timing, struct forging, offset extraction) | ✅ Implemented and verified separately |
+
+### What is **not** verified
+
+- **The full RCE chain was not reproduced end to end.** The
+  `php2shell-rce:8.2.34` image compiles and serves traffic, but the request
+  that chains OOM → UAF → forged `zend_array` → `system()` call never
+  produced observable code execution in this environment.
+
+- **The blocking issue is identified and measured, not an unknown.** After the
+  OOM, the dangling array keeps `pDestructor == zval_ptr_dtor` (**not**
+  `zif_system`) and `nTableSize == 8`: the destructor pointer and the table
+  size survive intact, while the refcount and the flags are garbage. Two
+  requirements remain: (a) that a 56-byte allocation lands exactly on the
+  freed slot — reachable with spray, not with exact control — and (b) that
+  this allocation writes `zif_system` at offset `0x30` while keeping a valid
+  hash table with an `IS_STRING` bucket. See **§10.11-bis** of the article.
+
+- **Therefore `php2shell_rce.py` and `php2shell_rce_exploit.py` are research
+  scaffolding, not functional exploits.** Do not treat them as weaponizable.
+  Their value is different: they run the real scenario and **report the state
+  of the gadget on every attempt**, so progress is measurable and another
+  researcher with a better-suited environment can continue from there.
+
+- **The classic 288-byte spray from the public writeups does not work** for
+  this mechanism (§10.6): a 56-byte spray with the required pointer precision
+  was never modelled. No attacker-controlled allocation payloads were built.
+
+- **The spray figures (149 × 288 bytes) come from Akamai's public analysis**,
+  not from our own calibration. The layout of the forged structure was
+  independently cross-checked against the PHP source code.
+
+- **The functional detector (`behavioural_diff.py`) is the genuinely operational
+  piece**: it discriminates vulnerable from patched by observable behaviour,
+  with no offsets, no ASLR and no exploit execution. It is the recommended tool
+  for inventorying exposure across a fleet.
+
+### Operational warning
+
+- **Do not run this outside an isolated environment.** The containers are
+  deliberately configured with ASLR disabled, `mpm_prefork` and unpatched PHP
+  8.2.34. That makes them vulnerable **on purpose**.
+- **Audit any third-party PoC before running it.** It is documented (JFrog)
+  that some public repositories for these CVEs distribute fake malicious
+  payloads — in one case, a script that only changed the system wallpaper.
+- **The article distinguishes in every section whether a claim is our own
+  verification or public analysis.** If you cite it commercially, keep that
+  distinction: it is what makes the work credible.
+
+---
+
 ## What this is
 
 On 21 October 2026, the PHP project published an emergency release fixing **two**
@@ -113,8 +183,8 @@ problem.
 | `check_exposure.sh` | Single-pass exposure probe. `exit 1` = vulnerable, `exit 0` = patched |
 | `behavioural_diff.py` | Differential vulnerable/patched test with A/B controls |
 | `php2shell_leak.py` | UAF detector with negative controls |
-| `php2shell_rce.py` | Escalation scaffold: mounts the real scenario and collects the trace |
-| `php2shell_rce_exploit.py` | The RCE attempt: drives the scenario and reports whether the `pDestructor == zif_system` gadget is in place |
+| `php2shell_rce.py` | Escalation scaffold: mounts the real scenario and collects the trace. **⚠️ Work in progress — the full RCE chain was not reproduced end to end (see disclaimer above).** |
+| `php2shell_rce_exploit.py` | The RCE attempt: drives the scenario and reports whether the `pDestructor == zif_system` gadget is in place. **⚠️ Does not produce code execution (see disclaimer above).** |
 | `patches/` | Idempotent patches that instrument PHP itself (session + allocator + dtor site) |
 | `web/` | Lab endpoints |
 
