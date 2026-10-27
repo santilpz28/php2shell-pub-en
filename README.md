@@ -21,6 +21,13 @@ This disclaimer was added **at the end of the work** so that nobody mistakes
 rest of the material was modified: the article, the PoCs and the scripts are
 left as they are.
 
+> **Later update:** the article **has** received a subsequent technical
+> correction, documented in §10.11-bis: `zif_system` was shown **not** to be
+> a valid gadget, because its real signature
+> (`void (zend_execute_data *, zval *)`) is incompatible with `dtor_func_t`
+> (`void (*)(zval *)`). That correction affects the RCE premise, not the UAF
+> mechanism, which remains verified.
+
 ### What is verified end to end
 
 | Artifact | Status |

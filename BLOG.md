@@ -220,9 +220,13 @@ if (!PS(id) || !ZSTR_VAL(PS(id))[0]) {   /* <-- reads freed PS(id) */
   — which runs when building the `Set-Cookie` header — copies that live
   process memory into the HTTP response. That is **Heartbleed applied to PHP**.
 - **RCE**: `PS(http_session_vars)` is a freed `zend_array`. When destroying it
-  (`zend_hash_del` → `zend_array_destroy`), PHP invokes its `pDestructor`. If that
-  table has been **reclaimed** by the attacker with a forged `pDestructor`
-  pointing to `zif_system`, execution is direct.
+  (`zend_hash_del` → `zend_array_destroy`), PHP invokes its `pDestructor` if it
+  has buckets and the destructor is not `ZVAL_PTR_DTOR`. If that table has
+  been **reclaimed** by the attacker with a forged `pDestructor` pointing to a
+  function whose real signature is `void f(void *)`, execution is direct.
+  (The pointer's target **cannot** be `zif_system`: its real signature takes
+  two arguments and it is therefore not invocable as a `dtor_func_t` — see
+  §10.11-bis.)
 
 ### 2.4 Which pointer is responsible (experimentally isolated)
 
@@ -270,9 +274,43 @@ The reason that strategy does not work is the **signature**:
   valid `zend_execute_data` (parameters, return values, call context). Forging
   and depositing it is not enough for it to execute.
 - A `zend_array`, on the other hand, has a `pDestructor` that `zend_array_destroy`
-  invokes **directly with a `zval*` as its only argument** — which is exactly
-  the signature of `zif_system` (`ZEND_FUNCTION(system)` takes a `zval*` and a
-  return `zval*`).
+  invokes **directly with a `zval*` as its only argument**, which matches the
+  signature of `dtor_func_t`:
+
+  ```c
+  /* Zend/zend_types.h:104 */
+  typedef void (*dtor_func_t)(zval *pDest);
+  ```
+
+  ⚠️ **But `zif_system` does not satisfy that signature.** `ZEND_FUNCTION`s are
+  declared as:
+
+  ```c
+  /* Zend/zend_API.h:71-72 */
+  #define ZEND_NAMED_FUNCTION(name)  void ZEND_FASTCALL name(INTERNAL_FUNCTION_PARAMETERS)
+  #define ZEND_FUNCTION(name)         ZEND_NAMED_FUNCTION(zif_##name)
+
+  /* Zend/zend.h:49 */
+  #define INTERNAL_FUNCTION_PARAMETERS zend_execute_data *execute_data, zval *return_value
+  ```
+
+  That is, `zif_system` has the signature `void (zend_execute_data *, zval *)`
+  — **two** arguments — while `dtor_func_t` has **one**. Invoked as if it were
+  a destructor, `execute_data` receives the bucket's `zval*` and
+  `return_value` reads adjacent memory: **the command never reaches the
+  function**, because `system()` extracts its argument from `execute_data`,
+  not from the pointer it was handed.
+
+  This was verified by reading the core's own macros for PHP 8.2.34
+  (`Zend/zend_API.h`, `Zend/zend.h`) and the signature of `php_exec_ex`
+  (`ext/standard/exec.c:206`), which reads the command via
+  `ZEND_PARSE_PARAMETERS_START(1, ...)` → `Z_PARAM_STRING(cmd, cmd_len)`.
+
+  **Consequence:** the gadget many writeups propose — writing `&zif_system`
+  at offset `0x30` of the slot — **does not produce command execution**. The
+  `pDestructor` primitive is real, but the pointer's target must be a
+  function whose real signature is compatible with `void (*)(void *)` and
+  which interprets that pointer as the command.
 
 That apparently minor difference separates an exploit that works from one that
 does not. The correct primitive is:
@@ -283,7 +321,7 @@ does not. The correct primitive is:
 3. Reclaim that slot with a forged zend_array:
       - consistent nTableSize / nTableMask
       - arData pointing to a controlled array of buckets
-      - pDestructor = zif_system
+      - pDestructor = <function with signature void f(void *), not zif_system>
       - a bucket whose value is a zend_string with the command
 4. Request B: php_session_rfc1867_cleanup() -> zend_hash_del() ->
    zend_array_destroy() -> pDestructor(&value) -> system("cmd")
@@ -361,7 +399,8 @@ nothing; what breaks things is the **subsequent consumption of the state**.
    -> operates on freed PS(http_session_vars) -> UAF
 4. With the memory reclaimed in a controlled way:
    -> PS(http_session_vars) is a forged hash table
-   -> its pDestructor = zif_system -> system("cmd") when destroyed
+   -> its pDestructor = <function void f(void *)> -> the command executes
+      when the array is destroyed
 ```
 
 ---
@@ -1067,9 +1106,11 @@ that **a 56-byte spray —not a 288-byte one— should work**, against the
 assumption that a large blob is required.
 
 The requirement that remains to be solved is not timing but **control**:
-achieving that the 56-byte allocation landing in the slot be a
-forged `zend_array` with `pDestructor = zif_system`, and that the command to
-execute live in a separate `zend_string`, because 56 bytes do not allow for more.
+achieving that the 56-byte allocation landing in the slot be a forged
+`zend_array` with a `pDestructor` pointing to a function invocable as a
+`dtor_func_t`, and that the command to execute live in a separate
+`zend_string`, because 56 bytes do not allow for more. (The natural
+candidate, `zif_system`, **does not** satisfy the signature — see §10.11-bis.)
 
 ### 10.7 ASLR and verified offsets
 
@@ -1231,7 +1272,8 @@ lives entirely in the request heap and the effect is the one described in §10.2
 - **Full RCE.** The instrumentation has resolved *where* the slot is
   (`arr=0x79c99ce54310`, 56 bytes, bin 6) and has proven that Request B
   consumes exactly that slot. What is missing is **placing** a controlled
-  structure at that exact position with `pDestructor = zif_system`.
+  structure at that exact position with a `pDestructor` pointing to a gadget
+  invocable with the signature `void f(void *)`.
 - **Arbitrary memory exfiltration.** The dangling `zend_string` is
   read, but its observed length is still that of the legitimate SID (32
   characters). Controlling *which* bytes are read requires the same kind of
@@ -1250,8 +1292,8 @@ structure of exactly 56 bytes.
    reassigned, and its position in the pool is predictable (element 14 of a
    0x38 progression). The LIFO allocation order hits 28.4 % of the time.
 2. Force the placement of a 56-byte `zend_array` in that specific
-   slot, with `pDestructor = zif_system` and the command in a
-   separate `zend_string`. **This is the step that blocks the RCE.**
+   slot, with a `pDestructor` compatible with `dtor_func_t` and the command
+   in a separate `zend_string`. **This is the step that blocks the RCE.**
 3. Verify execution on the local target.
 
 Point 2 is a problem of **allocator control**, not of timing. The
@@ -1280,11 +1322,85 @@ if (UNEXPECTED(ht->pDestructor != ZVAL_PTR_DTOR)) {
 }
 ```
 
-`ZEND_FUNCTION(system)` has the signature `void system(zval *, ...)`, compatible
-with `dtor_func_t`. Therefore: **if the freed `zend_array` carries
-`pDestructor == zif_system` and one of its buckets contains a `zval` of type
-`IS_STRING`, the destructor call becomes `system(&bucket.val)`,
-and the string is the command.**
+#### An obstacle that is not about the allocator: the gadget's signature
+
+There is a second requirement, independent of heap control, and it can be
+verified by reading three lines of the core:
+
+```c
+/* Zend/zend_API.h:71-72 */
+#define ZEND_NAMED_FUNCTION(name)  void ZEND_FASTCALL name(INTERNAL_FUNCTION_PARAMETERS)
+#define ZEND_FUNCTION(name)         ZEND_NAMED_FUNCTION(zif_##name)
+
+/* Zend/zend.h:49 */
+#define INTERNAL_FUNCTION_PARAMETERS zend_execute_data *execute_data, zval *return_value
+
+/* ext/standard/exec.c:206 */
+static void php_exec_ex(INTERNAL_FUNCTION_PARAMETERS, int mode) { ... }
+```
+
+`zif_system` therefore has the signature
+`void (zend_execute_data *, zval *)`: **two** arguments. `dtor_func_t` has
+**one**: `void (*)(zval *)`.
+
+If `pDestructor` points to `zif_system`, the actual call is:
+
+```c
+ht->pDestructor(&bucket.val);
+/* which becomes: */
+zif_system((zend_execute_data*)&bucket.val, (zval*)<garbage>);
+```
+
+`execute_data` receives the bucket's `zval*` and `return_value` reads
+adjacent memory. The command **never reaches `system()`**, because
+`php_exec_ex` extracts it from the `execute_data` with
+`ZEND_PARSE_PARAMETERS_START(1, ...)` → `Z_PARAM_STRING(cmd, cmd_len)`, not
+from the pointer it was handed.
+
+**Therefore: writing `&zif_system` at offset `0x30` of the slot does not
+produce command execution.** The pointer's target must be a function whose
+real signature is `void f(void *)` and which interprets that pointer as the
+command.
+
+This is not a nuance: it is the difference between a gadget and a crash. And
+it is precisely the point the public writeups do not distinguish.
+
+What *is* true is that PHP's real destructor functions do have that
+single-pointer signature. In `Zend/zend_variables.c`, the `rc_dtor_func`
+table maps each type to a destructor with the signature
+`void (*)(zend_refcounted *p)`:
+
+```c
+static const zend_rc_dtor_func_t rc_dtor_func[IS_CONSTANT_AST + 1] = {
+    /* IS_UNDEF        */ (zend_rc_dtor_func_t)zend_empty_destroy,
+    /* IS_STRING       */ (zend_rc_dtor_func_t)zend_string_destroy,
+    /* IS_ARRAY        */ (zend_rc_dtor_func_t)zend_array_destroy,
+    /* IS_OBJECT       */ (zend_rc_dtor_func_t)zend_objects_store_del,
+    ...
+};
+```
+
+So the primitive (`pDestructor` invocable indirectly with a pointer) is
+sound; what is missing is **the specific function to payload into that
+pointer**, and it has to have the single-pointer signature and consume it as
+the command.
+
+There is a third requirement, also measured: the custom destructor is only
+invoked if the array has buckets.
+
+```c
+/* Zend/zend_hash.c:1755-1760 */
+if (ht->nNumUsed) {                              /* <- only if there are buckets */
+    if (UNEXPECTED(ht->pDestructor != ZVAL_PTR_DTOR)) {
+        zend_hash_destroy(ht);                   /* -> ht->pDestructor(data) */
+        goto free_ht;
+    }
+}
+```
+
+In the measured dangling array, `nNumUsed = 0`: the `pDestructor` **never
+gets invoked** and the crash comes from corrupted `arData`. Forging the
+gadget must additionally produce an array with at least one occupied bucket.
 
 The exact point where this fits is in `php_session_track_init()`
 (`ext/session/session.c`):
@@ -1308,22 +1424,65 @@ That defines exactly what is missing:
 | The freed `zend_array` is 56 bytes (bin 6) | ✅ measured |
 | The slot position in the pool is predictable | ✅ measured (element 14, step 0x38) |
 | The next 56 B allocation reuses it | ⚠️ 28,4 % per attempt (LIFO, per page) |
-| The slot's `pDestructor` is `zif_system` | ❌ **it is still `zval_ptr_dtor`** |
+| The slot's `pDestructor` is an invocable gadget | ❌ **it is still `zval_ptr_dtor`** |
+| The gadget has a `void f(void *)` compatible signature | ⚠️ **`zif_system` is NOT** (two-argument signature) |
 | An `IS_STRING` bucket with the command | ❌ not reached |
+| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
 
-**The requirement that blocks the RCE is the fourth one.** To achieve it, two
-things are needed at the same time:
+**The requirements that block the RCE are the fourth, the fifth and the
+seventh.** Three things are needed at once:
 
-1. For a 56-byte allocation to land **exactly** in the freed slot.
-   This is an allocator control problem, and the 28,4 % per attempt makes it
-   reachable with several attempts — but with a spray, not with exact control.
-2. For that allocation to write `zif_system` at offset `0x30` of the slot
-   while keeping the rest of the structure as a valid hash table with an
-   `IS_STRING` bucket.
+1. A 56-byte allocation lands **exactly** on the freed slot. This is an
+   allocator-control problem, and the 28.4 % per attempt makes it reachable
+   over several attempts — but with spray, not with exact control.
+2. That allocation writes at offset `0x30` a pointer to a function whose
+   real signature is `void f(void *)` — **not `zif_system`**, whose signature
+   is `void (zend_execute_data *, zval *)` and is therefore not invocable as
+   a `dtor_func_t` (see §10.11-bis) — while keeping the rest of the
+   structure a valid hash table.
+3. The forged array has at least one occupied bucket (`nNumUsed >= 1`),
+   because `zend_array_destroy` only invokes the custom `pDestructor` in
+   that case.
 
 Point 2 is the hard one, because a forged `zend_array` cannot carry the
-command inside itself: 56 bytes do not allow for more. The command has to live
-in another allocation — a `zend_string` — that the bucket points to.
+command inside itself: 56 bytes are not enough for more. The command has to
+live in another allocation — a `zend_string` — that the bucket points to.
+
+And there is an additional nuance about *where* the destructor receives the
+pointer. In the hash-table path, the `zval*` passed to `pDestructor` is
+`&bucket.val` — and the bucket is a **separate** 32-byte allocation, not
+the 56-byte slot. In the *packed* path it is `&arPacked[i]`, and `arPacked`
+is not the 56-byte slot either. That is: the `zend_array` (56 B) and the
+buckets (32 B) are separate allocations, which changes the spray strategy
+entirely relative to what the writeups assume.
+| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
+
+**The requirements that block the RCE are the fourth, the fifth and the
+seventh.** Three things are needed at once:
+
+1. A 56-byte allocation lands **exactly** on the freed slot. This is an
+   allocator-control problem, and the 28.4 % per attempt makes it reachable
+   over several attempts — but with spray, not with exact control.
+2. That allocation writes at offset `0x30` a pointer to a function whose
+   real signature is `void f(void *)` — **not `zif_system`**, whose signature
+   is `void (zend_execute_data *, zval *)` and is therefore not invocable as
+   a `dtor_func_t` (see §10.11-bis) — while keeping the rest of the
+   structure a valid hash table.
+3. The forged array has at least one occupied bucket (`nNumUsed >= 1`),
+   because `zend_array_destroy` only invokes the custom `pDestructor` in
+   that case.
+
+Point 2 is the hard one, because a forged `zend_array` cannot carry the
+command inside itself: 56 bytes do not allow for more. The command has to
+live in another allocation — a `zend_string` — that the bucket points to.
+
+And there is an additional nuance about *where* the destructor receives the
+pointer. In the hash-table path, the `zval*` passed to `pDestructor` is
+`&bucket.val` — and the bucket is a **separate** 32-byte allocation, not
+the 56-byte slot. In the *packed* path it is `&arPacked[i]`, and `arPacked`
+is not the 56-byte slot either. That is: the `zend_array` (56 B) and the
+buckets (32 B) are separate allocations, which changes the spray strategy
+entirely relative to what the writeups assume.
 
 **What was NOT done and why it is not claimed:** a 56-byte allocation with
 attacker-chosen content was not built. The classic 288-byte spray from the
@@ -1531,7 +1690,11 @@ And against the patched target (8081), the same detector must not observe
 | That the failure manifests as corruption of the Zend MM allocator | Disassembly of the crash site: the read of `bin->slots[]` follows an unmapped page pointer (`RCX=0x7ffff745520000`) |
 | That the official patch cuts the OOM path | Reading the hunk for `ext/session/session.c` in `31c0ea7d7ff`: `PS(in_rfc1867_update)`, `php_rinit_session_globals()` in `MULTIPART_EVENT_START` and `if (PG(modules_activated)) return retval;` |
 | That injection into the session file is possible | The upload's `filename` is stored literally in the session file (verified by reading `/tmp/sess_*`) |
-| That the actual RCE mechanism uses a hash table with `pDestructor`, not a `zend_internal_function` | Reading the PHP source code (`zend_array_destroy` invokes `pDestructor` with a `zval*`, which is the signature of `zif_system`) and contrasting it with working public PoCs |
+| That the actual RCE mechanism uses a hash table with `pDestructor`, not a `zend_internal_function` | Reading the PHP source code: `zend_array_destroy` invokes `ht->pDestructor` with a `zval*`, consistent with `dtor_func_t` (`void (*)(zval *)`) |
+| That **`zif_system` is NOT a valid gadget** (later correction) | Reading the core macros: `ZEND_FUNCTION` expands to `void (zend_execute_data *, zval *)` (`Zend/zend_API.h:71`, `Zend/zend.h:49`) — a **two**-argument signature incompatible with `dtor_func_t`. `php_exec_ex` takes the command from the `execute_data` (`ext/standard/exec.c:206`), not from the pointer received. **This point corrects the original premise of this article and of the writeups that replicate it** |
+| That the custom `pDestructor` is only invoked when there are buckets | Reading `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Measured: the dangling array has `nNumUsed = 0` |
+| That Zend MM's allocator uses a per-bin LIFO free list | Reading `zend_mm_free_small` / `zend_mm_alloc_small` (`Zend/zend_alloc.c:1300-1338`): the freed slot is pushed onto the head of `free_slot[bin]` and the allocation takes it from the head. Measured in the trace: `FREE_SMALL 0x...41c0` followed by `ALLOC_SMALL 0x...41c0` |
+| The real layout of `zend_array` (`pDestructor` at 0x30) and of the candidate structures | An `offsetof` program compiled against the real PHP 8.2.34 headers: `zend_array` 56 B (`pDestructor` 0x30), `zend_object` 56 B, `Bucket` 32 B (`val` 0x00), `zval` 16 B, `zend_string` 32 B (`val` 0x18) |
 | That the crash **does not depend** on Request B's `PHPSESSID` | A/B control: Request B with identical SID (crash 4/4) vs different SID (crash 4/4) |
 | That the `PHP_SESSION_UPLOAD_PROGRESS` field in Request B is **essential** | A/B control: Request B without that field → crash 0/4 |
 | That the OOM is **necessary and sufficient** | A/B control: Request B with `upload_progress` but no prior OOM → crash 0/4; with OOM → crash 4/4 |
@@ -1561,8 +1724,10 @@ And against the patched target (8081), the same detector must not observe
 - The spray figures (149 × 288) come from Akamai's analysis. The struct layout
   was independently cross-checked against the source code.
 - The four-stage ASLR leak chain (chunk base → `libphp` base →
-  `zif_system` → table forging) is documented in the cited public PoCs; it was
-  not reimplemented here.
+  gadget → table forging) is documented in the cited public PoCs; it was not
+  reimplemented here. **Note:** the "→ gadget" step in those writeups is
+  usually concretised as `zif_system`, which §10.11-bis shows is not
+  invocable with the required signature.
 
 ### Note on public PoCs: two sources of risk
 
