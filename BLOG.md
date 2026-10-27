@@ -1463,7 +1463,8 @@ the 56-byte slot. In the *packed* path it is `&arPacked[i]`, and `arPacked`
 is not the 56-byte slot either. That is: the `zend_array` (56 B) and the
 buckets (32 B) are separate allocations, which changes the spray strategy
 entirely relative to what the writeups assume.
-| The dangling array has `nNumUsed >= 1` | ❌ measured `nNumUsed = 0` (the `pDestructor` is not even invoked) |
+| The dangling array has `nNumUsed >= 1` | ✅ measured `nNumUsed = 1` in the raw dump; but `arData` is garbage, so the bucket is not addressable |
+| The slot's `arData` points to a valid bucket table | ❌ **it holds `arr + 0x30` (self-referential garbage)** |
 
 **The requirements that block the RCE are the fourth, the fifth and the
 seventh.** Three things are needed at once:
@@ -1792,7 +1793,7 @@ And against the patched target (8081), the same detector must not observe
 | That injection into the session file is possible | The upload's `filename` is stored literally in the session file (verified by reading `/tmp/sess_*`) |
 | That the actual RCE mechanism uses a hash table with `pDestructor`, not a `zend_internal_function` | Reading the PHP source code: `zend_array_destroy` invokes `ht->pDestructor` with a `zval*`, consistent with `dtor_func_t` (`void (*)(zval *)`) |
 | That **`zif_system` is NOT a valid gadget** (later correction) | Reading the core macros: `ZEND_FUNCTION` expands to `void (zend_execute_data *, zval *)` (`Zend/zend_API.h:71`, `Zend/zend.h:49`) — a **two**-argument signature incompatible with `dtor_func_t`. `php_exec_ex` takes the command from the `execute_data` (`ext/standard/exec.c:206`), not from the pointer received. **This point corrects the original premise of this article and of the writeups that replicate it** |
-| That the custom `pDestructor` is only invoked when there are buckets | Reading `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Measured: the dangling array has `nNumUsed = 0` |
+| That the custom `pDestructor` is only invoked when there are buckets | Reading `zend_array_destroy` (`Zend/zend_hash.c:1755-1760`): `if (ht->nNumUsed) { if (ht->pDestructor != ZVAL_PTR_DTOR) ... }`. Measured in the raw dump: `nNumUsed = 1`, but `arData` is garbage |
 | That Zend MM's allocator uses a per-bin LIFO free list | Reading `zend_mm_free_small` / `zend_mm_alloc_small` (`Zend/zend_alloc.c:1300-1338`): the freed slot is pushed onto the head of `free_slot[bin]` and the allocation takes it from the head. Measured in the trace: `FREE_SMALL 0x...41c0` followed by `ALLOC_SMALL 0x...41c0` |
 | The real layout of `zend_array` (`pDestructor` at 0x30) and of the candidate structures | An `offsetof` program compiled against the real PHP 8.2.34 headers: `zend_array` 56 B (`pDestructor` 0x30), `zend_object` 56 B, `Bucket` 32 B (`val` 0x00), `zval` 16 B, `zend_string` 32 B (`val` 0x18) |
 | That the crash **does not depend** on Request B's `PHPSESSID` | A/B control: Request B with identical SID (crash 4/4) vs different SID (crash 4/4) |
