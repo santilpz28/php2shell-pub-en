@@ -1,0 +1,154 @@
+# Target de laboratorio INSTRUMENTADO para la escalada a RCE
+# (CVE-2026-109619 / PHP2Shell).
+#
+# Diferencias respecto a Dockerfile.rce:
+#   1. Aplica el parche de instrumentacion (patches/apply_trace_patch.py)
+#      a ext/session/session.c ANTES de compilar. El binario resultante
+#      registra en /tmp/php2shell_trace.log:
+#        - TRACK_INIT: direccion, tamano y pDestructor del zend_array de sesion
+#        - CLEANUP:   la direccion exacta que consume el Request B (UAF)
+#   2. Compila en dos fases para no agotar la memoria del build:
+#      `make` sin -j (el build con -j mataba el container con OOM).
+#
+# IMPORTANTE: solo para laboratorio aislado. Nunca en produccion.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      autoconf bison re2c pkg-config \
+      gcc g++ make \
+      libxml2-dev libssl-dev libcurl4-openssl-dev libsqlite3-dev \
+      libonig-dev libreadline-dev zlib1g-dev libargon2-dev \
+      libsodium-dev libzip-dev \
+      apache2 apache2-dev apache2-utils \
+      ca-certificates curl xz-utils file \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY .cache/php-8.2.34.tar.gz /build/
+
+# a2enmod vive en /usr/sbin, que NO esta en el PATH por defecto durante
+# el build de Docker. apxs2 lo invoca como "a2enmod" (exec) y ademas
+# resetea el PATH en su propio subshell, por lo que un ENV PATH no basta.
+# Solucion robusta: symlink en /usr/bin, que SI esta siempre en el PATH.
+ENV PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+RUN ln -sf /usr/sbin/a2enmod /usr/bin/a2enmod \
+ && ln -sf /usr/sbin/a2endismod /usr/bin/a2endismod \
+ && ln -sf /usr/sbin/a2enconf /usr/bin/a2enconf \
+ && ln -sf /usr/sbin/a2ensite /usr/bin/a2ensite \
+ && test -x /usr/bin/a2enmod && echo "a2enmod symlink OK"
+
+# ---------------------------------------------------------------------------
+# Instrumentacion: se aplica al fuente ANTES de configurar/compilar.
+#
+# El parche es idempotente y solo escribe a /tmp/php2shell_trace.log.
+# No altera la semantica: solo anade fprintf de diagnostico.
+# ---------------------------------------------------------------------------
+COPY patches/apply_trace_patch.py /build/apply_trace_patch.py
+COPY patches/apply_alloc_trace_patch.py /build/apply_alloc_trace_patch.py
+RUN tar xzf php-8.2.34.tar.gz && cd php-8.2.34 && \
+    python3 /build/apply_trace_patch.py ext/session/session.c && \
+    python3 /build/apply_alloc_trace_patch.py Zend/zend_alloc.c && \
+    grep -c "PHP2SHELL_TRACE\|PHP2SHELL_FREE" ext/session/session.c && \
+    grep -c "PHP2SHELL_ALLOC" Zend/zend_alloc.c && \
+    echo "PATCHES APLICADOS OK"
+
+# Build conjunto de PHP CLI + mod_php con simbolos.
+# NOTA: `make` SIN -j a proposito. Con -j el enlazador de libphp.so
+# consume >2GB y el build muere con OOM (exit 137).
+RUN cd /build/php-8.2.34 && \
+    ./configure \
+      --prefix=/usr/local/php-symbols \
+      --with-apxs2=/usr/bin/apxs2 \
+      --enable-session \
+      --disable-cgi \
+      --disable-phpdbg \
+      --disable-opcache \
+      --without-pear \
+      --enable-cli \
+      --with-openssl \
+    && make \
+    && make install \
+    && echo "PHP+MOD_PHP BUILD OK" \
+    && ls -la /usr/local/php-symbols/bin/php \
+    && find / -name "libphp.so" 2>/dev/null
+
+# La config de handlers de PHP (AddHandler / SetHandler / DirectoryIndex)
+# la instalaba el paquete libapache2-mod-php de Debian. Como aqui solo se
+# usa el modulo compilado, hay que declararla a mano; sin esto Apache
+# sirve el .php como TEXTO PLANO en vez de ejecutarlo.
+RUN printf '%s\n' \
+      '<FilesMatch ".+\.ph(ar|p|tml)$">' \
+      '    SetHandler application/x-httpd-php' \
+      '</FilesMatch>' \
+      '<FilesMatch ".+\.phps$">' \
+      '    SetHandler application/x-httpd-php-source' \
+      '</FilesMatch>' \
+      'DirectoryIndex index.php index.html' \
+      > /etc/apache2/conf-available/php-handlers.conf && \
+    a2enconf php-handlers && \
+    ls -la /etc/apache2/conf-enabled/php-handlers.conf
+
+# INI de PHP para reproducibilidad del PoC.
+#
+# session.upload_progress.cleanup=On es OBLIGATORIO para la cadena UAF:
+# es php_session_rfc1867_cleanup() (MULTIPART_EVENT_END) la que llama a
+# php_session_initialize() y lee el PS(id) colgando de la peticion anterior.
+# Con cleanup=Off esa ruta no existe.
+#
+# memory_limit=32M hace factible el OOM que deja el estado colgando
+# (uploads anidados vacios: ~536KB de HTTP agotan 32MB de heap PHP).
+RUN { \
+      echo 'session.upload_progress.enabled=On'; \
+      echo 'session.upload_progress.name=PHP_SESSION_UPLOAD_PROGRESS'; \
+      echo 'session.upload_progress.cleanup=On'; \
+      echo 'session.upload_progress.min_freq=1'; \
+      echo 'session.save_path=/tmp/'; \
+      echo 'memory_limit=32M'; \
+      echo 'post_max_size=8M'; \
+      echo 'upload_max_filesize=8M'; \
+      echo 'max_file_uploads=1000'; \
+      echo 'max_multipart_body_parts=-1'; \
+    } > /usr/local/php-symbols/lib/php.ini && \
+    cat /usr/local/php-symbols/lib/php.ini
+
+# Apache arranca con ASLR desactivado (setarch -R) para que las
+# direcciones del binario sean estables y el PoC pueda usar offsets.
+RUN printf '#!/bin/sh\nexec /usr/bin/setarch "$(uname -m)" -R /usr/sbin/apache2 -D FOREGROUND\n' \
+      > /usr/local/bin/apache2-noraslr && chmod +x /usr/local/bin/apache2-noraslr
+
+EXPOSE 80
+
+ENV APACHE_RUN_DIR=/var/run/apache2 \
+    APACHE_PID_FILE=/var/run/apache2/apache2.pid \
+    APACHE_LOCK_DIR=/var/lock/apache2 \
+    APACHE_LOG_DIR=/var/log/apache2 \
+    APACHE_DOCUMENT_ROOT=/var/www/html \
+    APACHE_RUN_USER=www-data \
+    APACHE_RUN_GROUP=www-data
+
+# Apache en Debian usa mpm_event (threaded). El PHP compilado aqui NO es
+# thread-safe, asi que hace falta mpm_prefork. Ademas prefork es lo
+# requerido para el UAF: un proceso por worker hace que el estado stale
+# sobreviva entre peticiones del mismo worker.
+#
+# StartServers/ServerLimit/MaxRequestWorkers = 1: con un unico worker el
+# exploit es determinista (la peticion B siempre cae en el worker que
+# sufrio el OOM en la peticion A).
+RUN a2dismod mpm_event mpm_worker 2>/dev/null || true; \
+    a2enmod mpm_prefork && \
+    printf '%s\n' \
+      '<IfModule mpm_prefork_module>' \
+      '    StartServers 1' \
+      '    ServerLimit 1' \
+      '    MaxRequestWorkers 1' \
+      '</IfModule>' \
+      > /etc/apache2/conf-available/one-worker.conf && \
+    a2enconf one-worker && \
+    mkdir -p "$APACHE_RUN_DIR" "$APACHE_LOCK_DIR" "$APACHE_LOG_DIR" && \
+    mkdir -p /var/www/html
+
+# El directorio de la traza debe existir y ser escribible por www-data.
+RUN mkdir -p /tmp/php2shell && touch /tmp/php2shell_trace.log /tmp/php2shell_alloc.log && \
+    chmod 666 /tmp/php2shell_trace.log /tmp/php2shell_alloc.log
+
+CMD ["/usr/local/bin/apache2-noraslr"]

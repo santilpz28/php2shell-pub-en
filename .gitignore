@@ -1,0 +1,6 @@
+# Artefactos de build pesados
+.cache/
+*.tar.gz
+php-symbols
+__pycache__/
+*.pyc

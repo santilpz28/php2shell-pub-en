@@ -1,0 +1,81 @@
+# Laboratorio PHP2Shell - imagen con Apache + mod_php
+# Necesario porque el RCE confirmado de CVE-2026-109619 requiere mod_php
+# (el estado stale debe sobrevivir entre peticiones en el mismo worker).
+FROM php:8.2.34-apache
+
+RUN docker-php-ext-install session \
+ && a2enmod headers \
+ && mkdir -p /tmp/upcache \
+ && chmod 777 /tmp/upcache
+
+# El modulo upload_progress de Apache (mod_upload_progress) es OPUESTO al
+# upload_progress de PHP: cachea el estado en disco/memoria para que PHP
+# pueda consultar el progreso entre peticiones. El PoC necesita ambos.
+#
+# Esta version del modulo usa SHARED MEMORY (no UploadProgressCacheDir):
+#   UploadProgressSharedMemorySize -> tamano del segmento (en MB)
+#   UploadProgressDir              -> directorio de la cache en disco
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libapache2-mod-upload-progress \
+ && a2enmod upload_progress \
+ && printf 'UploadProgressSharedMemorySize 1024\n' \
+      > /etc/apache2/conf-available/uploadprogress.conf \
+ && a2enconf uploadprogress \
+ && rm -rf /var/lib/apt/lists/*
+
+# Configuracion clave para reproducibilidad del PoC
+# - session.upload_progress.enabled=On : es el default de fabrica, dejarlo explicito
+# - session.upload_progress.min_freq=1  : ratio de actualizacion (segundos)
+# - session.upload_progress.cleanup=On  : OBLIGATORIO para la rama UAF. Es el
+#       default de fabrica. Con cleanup=Off, php_session_rfc1867_cleanup() no se
+#       llama en MULTIPART_EVENT_END y el estado colgante nunca se consume
+#       (verificado: control A/B, 0/4 crashes con cleanup=Off).
+# - max_multipart_body_parts=-1 : DESACTIVA el limite de partes del multipart.
+#       Sin esto, PHP corta la peticion con "Multipart body parts limit
+#       exceeded 1020" ANTES del OOM y la cadena no arranca. Este limite es
+#       una mitigacion real (ver seccion 8 del BLOG) y por defecto esta a 1500.
+#       OJO: el valor 0 significa "usar el default", NO "ilimitado". El valor
+#       correcto para desactivar el limite es -1.
+# - max_file_uploads=1000 : sube el limite de ficheros por request (default
+#       de fabrica: 20). Es NECESARIO para que los uploads anidados vacios
+#       lleguen al OOM: con 20, PHP deja de procesarlos y nunca agota el heap.
+#       NOTA: con filename="" el fichero no cuenta para este limite, pero la
+#       anidacion del nombre de campo si crea la jerarquia $_FILES completa.
+# - memory_limit=32M: con 3000 uploads anidados y memory_limit=32M se agota
+#       el heap con solo ~536 KB de cuerpo HTTP.
+RUN { \
+      echo 'session.upload_progress.enabled=On'; \
+      echo 'session.upload_progress.name=PHP_SESSION_UPLOAD_PROGRESS'; \
+      echo 'session.upload_progress.min_freq=1'; \
+      echo 'session.upload_progress.cleanup=On'; \
+      echo 'session.save_path=/tmp/'; \
+      echo 'max_multipart_body_parts=-1'; \
+      echo 'max_file_uploads=1000'; \
+      echo 'memory_limit=32M'; \
+      echo 'upload_progress.enabled=On'; \
+      echo 'upload_progress.cleanup=Off'; \
+    } > /usr/local/etc/php/conf.d/zz-php2shell-lab.ini
+
+# Desactivar OPcache. NO es una medida de seguridad: es una condicion de
+# REPRODUCIBILIDAD del laboratorio. Con OPcache activo, el use-after-free
+# tambien existe, pero no se manifiesta como SIGSEGV (0/6 en el laboratorio);
+# sin OPcache se manifiesta en 6/6. Ver seccion 10.8 del BLOG.
+# En un despliegue real: NO desactivar OPcache por esto. Actualizar PHP.
+RUN rm -f /usr/local/etc/php/conf.d/docker-php-ext-opcache.ini || true
+
+RUN sed -i 's#php_admin_value\[upload_progress.enabled\].*##' /etc/apache2/conf-enabled/docker-php.conf 2>/dev/null || true
+
+# Un SOLO worker de Apache. Es IMPRESCINDIBLE para la reproducibilidad:
+# el estado colgante vive en la memoria del proceso, asi que el Request B
+# tiene que ser atendido por el MISMO worker que atendio el Request A.
+# Con los valores por defecto (StartServers 5, MinSpareServers 5) hay varios
+# workers y Apache reparte las peticiones entre ellos: el Request B llegaria
+# a un worker limpio y el UAF no se observaria.
+RUN { \
+      echo 'StartServers 1'; \
+      echo 'MinSpareServers 1'; \
+      echo 'MaxSpareServers 1'; \
+      echo 'MaxRequestWorkers 1'; \
+    } > /etc/apache2/conf-enabled/zz-php2shell-prefork.conf
+
+EXPOSE 80

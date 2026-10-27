@@ -1,0 +1,33 @@
+services:
+  php-vuln:
+    image: php:8.2.34-cli
+    container_name: php2shell-vuln
+    working_dir: /app
+    volumes:
+      - ./web:/app
+    command: >
+      sh -c "php -d session.upload_progress.enabled=On
+             -d session.upload_progress.cleanup=On
+             -d memory_limit=256M
+             -S 0.0.0.0:8080 -t /app" &
+    healthcheck:
+      test: ["CMD", "php", "-r", "echo 1;"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  php-patched:
+    image: php:8.2.35-cli
+    container_name: php2shell-patched
+    working_dir: /app
+    volumes:
+      - ./web:/app
+    command: >
+      sh -c "php -d session.upload_progress.enabled=On
+             -d session.upload_progress.cleanup=On
+             -d memory_limit=256M
+             -S 0.0.0.0:8081 -t /app" &
+    healthcheck:
+      test: ["CMD", "php", "-r", "echo 1;"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

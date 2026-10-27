@@ -1,0 +1,158 @@
+# Target de laboratorio para PoC de RCE real (CVE-2026-109619).
+#
+# Diferencias clave respecto al target "de exposicion":
+#   1. PHP + mod_php compilados CON simbolos (no stripped)
+#   2. Apache arranca con ASLR desactivado (setarch -R) -> direcciones
+#      absolutas estables, necesarias para la struct forjada
+#   3. Apache + mod_php (prefork): el estado stale sobrevive entre peticiones
+#      en el mismo worker, requisito del RCE app-independent
+#
+# IMPORTANTE: solo para laboratorio aislado. Nunca en produccion.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      autoconf bison re2c pkg-config \
+      gcc g++ make \
+      libxml2-dev libssl-dev libcurl4-openssl-dev libsqlite3-dev \
+      libonig-dev libreadline-dev zlib1g-dev libargon2-dev \
+      libsodium-dev libzip-dev \
+      apache2 apache2-dev apache2-utils libapache2-mod-upload-progress \
+      ca-certificates curl xz-utils file \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY .cache/php-8.2.34.tar.gz /build/
+
+# a2enmod vive en /usr/sbin, que NO esta en el PATH por defecto durante
+# el build de Docker. apxs2 lo invoca como "a2enmod" (exec) y ademas
+# resetea el PATH en su propio subshell, por lo que un ENV PATH no basta.
+# Solucion robusta: symlink en /usr/bin, que SI esta siempre en el PATH.
+ENV PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+RUN ln -sf /usr/sbin/a2enmod /usr/bin/a2enmod \
+ && ln -sf /usr/sbin/a2endismod /usr/bin/a2endismod \
+ && ln -sf /usr/sbin/a2enconf /usr/bin/a2enconf \
+ && ln -sf /usr/sbin/a2ensite /usr/bin/a2ensite \
+ && test -x /usr/bin/a2enmod && echo "a2enmod symlink OK"
+
+# Build conjunto de PHP CLI + mod_php con simbolos.
+# Se usa --with-apxs2 (metodo estandar) en lugar de phpize, que requiere
+# el paquete php-dev del distro y no encaja con un prefixo custom.
+RUN tar xzf php-8.2.34.tar.gz && cd php-8.2.34 && \
+    ./configure \
+      --prefix=/usr/local/php-symbols \
+      --with-apxs2=/usr/bin/apxs2 \
+      --enable-session \
+      --disable-cgi \
+      --disable-phpdbg \
+      --disable-opcache \
+      --without-pear \
+      --enable-cli \
+      --with-openssl \
+    && make -j"$(nproc)" && make install && echo "PHP+MOD_PHP BUILD OK" \
+    && ls -la /usr/local/php-symbols/bin/php \
+    && find / -name "mod_php.so" 2>/dev/null
+
+# Configuracion de Apache.
+# El mod_php.so compilado con simbolos queda en el arbol de build de PHP
+# (sapi/apache2handler/.libs/mod_php.so). El paquete de Debian trae otro
+# mod_php.so (stripped) en /usr/lib/apache2/modules: lo reemplazamos.
+#
+# NOTA: cada RUN es un shell de una sola linea logica. Los comentarios '#'
+# NO pueden ir en medio de una cadena && (rompen el parseo del shell y el
+# resto del comando no se ejecuta) -> por eso los comentarios van FUERA
+# de las cadenas && y cada bloque logico va en su propio RUN.
+RUN a2enmod upload_progress headers && \
+    printf 'UploadProgressSharedMemorySize 1024\n' \
+      > /etc/apache2/conf-available/uploadprogress.conf && \
+    a2enconf uploadprogress && \
+    mkdir -p /tmp/upcache && chmod 777 /tmp/upcache
+
+# apxs2 (usado via --with-apxs2) ya instala el modulo compilado como
+# /usr/lib/apache2/modules/libphp.so durante "make install". Ese es el
+# nombre que espera el php.load de Debian, asi que no hay que copiar nada:
+# basta verificar que el modulo es el nuestro (con simbolos) y no el
+# stripped del paquete del distro.
+RUN ls -la /usr/lib/apache2/modules/libphp.so && \
+    (nm /usr/lib/apache2/modules/libphp.so | grep -w zif_system || \
+     echo "AVISO: zif_system no visible en la tabla de simbolos (puede ser local)")
+
+# La config de handlers de PHP (AddHandler / SetHandler / DirectoryIndex)
+# la instalaba el paquete libapache2-mod-php de Debian. Como aqui solo se
+# usa el modulo compilado, hay que declararla a mano; sin esto Apache
+# sirve el .php como TEXTO PLANO en vez de ejecutarlo.
+RUN printf '%s\n' \
+      '<FilesMatch ".+\.ph(ar|p|tml)$">' \
+      '    SetHandler application/x-httpd-php' \
+      '</FilesMatch>' \
+      '<FilesMatch ".+\.phps$">' \
+      '    SetHandler application/x-httpd-php-source' \
+      '</FilesMatch>' \
+      'DirectoryIndex index.php index.html' \
+      > /etc/apache2/conf-available/php-handlers.conf && \
+    a2enconf php-handlers && \
+    ls -la /etc/apache2/conf-enabled/php-handlers.conf
+
+# INI de PHP para reproducibilidad del PoC.
+#
+# session.upload_progress.cleanup=On es OBLIGATORIO para la cadena UAF:
+# es php_session_rfc1867_cleanup() (MULTIPART_EVENT_END) la que llama a
+# php_session_initialize() y lee el PS(id) colgando de la peticion anterior.
+# Con cleanup=Off esa ruta no existe.
+#
+# memory_limit=32M hace factible el OOM que deja el estado colgando
+# (uploads anidados vacios: ~500KB de HTTP agotan 32MB de heap PHP).
+RUN { \
+      echo 'session.upload_progress.enabled=On'; \
+      echo 'session.upload_progress.name=PHP_SESSION_UPLOAD_PROGRESS'; \
+      echo 'session.upload_progress.cleanup=On'; \
+      echo 'session.upload_progress.min_freq=1'; \
+      echo 'session.save_path=/tmp/'; \
+      echo 'memory_limit=32M'; \
+      echo 'post_max_size=8M'; \
+      echo 'upload_max_filesize=8M'; \
+      echo 'max_file_uploads=1000'; \
+    } > /usr/local/php-symbols/lib/php.ini && \
+    cat /usr/local/php-symbols/lib/php.ini
+
+# Apache arranca con ASLR desactivado (setarch -R) para que las
+# direcciones del binario sean estables y el PoC pueda usar offsets.
+# Se usan las variables de entorno del entrypoint oficial de la imagen
+# de PHP (APACHE_RUN_DIR, APACHE_PID_FILE, etc.), necesarias para que
+# apache2.conf sea valido.
+RUN printf '#!/bin/sh\nexec /usr/bin/setarch "$(uname -m)" -R /usr/sbin/apache2 -D FOREGROUND\n' \
+      > /usr/local/bin/apache2-noraslr && chmod +x /usr/local/bin/apache2-noraslr
+
+EXPOSE 80
+
+# Variables de entorno del entrypoint oficial de la imagen php:*-apache.
+# Son necesarias para que /etc/apache2/apache2.conf sea valido
+# (DefaultRuntimeDir, PidFile, DocumentRoot, etc.).
+ENV APACHE_RUN_DIR=/var/run/apache2 \
+    APACHE_PID_FILE=/var/run/apache2/apache2.pid \
+    APACHE_LOCK_DIR=/var/lock/apache2 \
+    APACHE_LOG_DIR=/var/log/apache2 \
+    APACHE_DOCUMENT_ROOT=/var/www/html \
+    APACHE_RUN_USER=www-data \
+    APACHE_RUN_GROUP=www-data
+
+# Apache en Debian usa mpm_event (threaded). El PHP compilado aqui NO es
+# thread-safe, asi que hace falta mpm_prefork. Ademas prefork es lo
+# requerido para el UAF: un proceso por worker hace que el estado stale
+# sobreviva entre peticiones del mismo worker.
+#
+# StartServers/ServerLimit/MaxRequestWorkers = 1: con un unico worker el
+# exploit es determinista (la peticion B siempre cae en el worker que
+# sufrio el OOM en la peticion A).
+RUN a2dismod mpm_event mpm_worker 2>/dev/null || true; \
+    a2enmod mpm_prefork && \
+    printf '%s\n' \
+      '<IfModule mpm_prefork_module>' \
+      '    StartServers 1' \
+      '    ServerLimit 1' \
+      '    MaxRequestWorkers 1' \
+      '</IfModule>' \
+      > /etc/apache2/conf-available/one-worker.conf && \
+    a2enconf one-worker && \
+    mkdir -p "$APACHE_RUN_DIR" "$APACHE_LOCK_DIR" "$APACHE_LOG_DIR"
+
+CMD ["/usr/local/bin/apache2-noraslr"]
