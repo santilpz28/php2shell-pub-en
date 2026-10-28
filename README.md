@@ -202,15 +202,18 @@ problem.
 ### Quick start
 
 ```bash
-# Bring up vulnerable (8080) + patched (8081)
-bash lab.sh
+# Bring up vulnerable (8080) + patched (8081) + backport (8082)
+docker compose up -d
 
 # Check exposure
 ./check_exposure.sh http://127.0.0.1:8080   # exit 1 → vulnerable
 ./check_exposure.sh http://127.0.0.1:8081   # exit 0 → patched
+./check_exposure.sh http://127.0.0.1:8082   # exit 0 → patched (backport)
 
 # Differential test
-python3 behavioural_diff.py --url http://127.0.0.1:8080
+python3 behavioural_diff.py 127.0.0.1 8080 "8.2.34 unpatched"
+python3 behavioural_diff.py 127.0.0.1 8081 "8.2.35 official"
+python3 behavioural_diff.py 127.0.0.1 8082 "8.2.34 + backport"
 ```
 
 ### Instrumented target
@@ -246,8 +249,7 @@ python3 php2shell_rce_exploit.py run --port 8084
 > the raw dump (§10.11-ter) shows `arr + 0x50` there, i.e. self-referential
 > garbage, with `arData` equally corrupted at `arr + 0x30`. The remaining
 > requirement is therefore to land a 56-byte allocation in that exact slot
-> that rebuilds **both** the `pDestructor` at offset `0x30` and a valid
-> `arData` at offset `0x10` with an `IS_STRING` bucket holding the command.
+> that rebuilds **both** the `pDestructor` at offset `0x30` and a valid> `arData` at offset `0x10` with an `IS_STRING` bucket holding the command.
 
 The gadget contract is real and verified in the source:
 
@@ -265,6 +267,45 @@ reproducible from scratch. Details in
 
 ---
 
+### Third target: patched WITHOUT changing the version
+
+The three targets are built like this:
+
+| Target | Version | How it is obtained |
+|---|---|---|
+| `php2shell-vuln:8.2.34` | 8.2.34 | `docker build -f Dockerfile -t php2shell-vuln:8.2.34 .` |
+| `php2shell-patched:8.2.35` | 8.2.35 | `docker build -f Dockerfile.patched -t php2shell-patched:8.2.35 .` |
+| `php2shell-backport:8.2.34` | **8.2.34** | `docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .` |
+
+The third one is the interesting one: **the same version number as the
+vulnerable one, the same extensions, the same ABI. Only the code changes.**
+The official patch ("Avoid state corruption via bailout", `31c0ea7d7ff`) is
+applied to the 8.2.34 source tree and recompiled.
+
+```bash
+docker compose up -d
+python3 behavioural_diff.py 127.0.0.1 8080 "8.2.34 unpatched"
+python3 behavioural_diff.py 127.0.0.1 8081 "8.2.35 official"
+python3 behavioural_diff.py 127.0.0.1 8082 "8.2.34 + backport"
+
+# Verify the patch fingerprint without looking at the version number
+python3 verify_backport.py --container php2shell-backport
+```
+
+Measured result (6 rounds per target, evidence in `evidence/backport/`):
+
+| Target | `php -v` | OOM | UAF consumed | Verdict |
+|---|---|---|---|---|
+| `:8080` | 8.2.34 | **6/6** | **6/6** (3 SIGSEGV + 3 stale SID) | VULNERABLE |
+| `:8081` | 8.2.35 | 0/6 | 0/6 | PATCHED |
+| `:8082` | **8.2.34** | 0/6 | 0/6 | **PATCHED** |
+
+The backport produces the same behaviour as the official 8.2.35 without
+touching the version number. Conflict details and the full procedure are in
+[`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md).
+
+---
+
 ## Remediation
 
 **The patch is the only complete answer.** INI-level mitigations are partial
@@ -273,6 +314,46 @@ by design.
 | Patched version | 8.2.35 · 8.3.36 · 8.4.27 · 8.5.12 |
 |---|---|
 | **PHP 7.4 / 8.0 / 8.1** | Outside the project's support cycle, but **PHP has published minimal source backports**. Update to your distro's package or apply the backport — do not stay on an EOL build as-is. |
+
+### And if you cannot update the version
+
+Updating PHP is the right thing to do, but it is not always possible: PECL
+extensions compiled against a specific version, platform dependencies, or
+certifications that pin the stack. In that case there is a fourth path:
+**patching the code while keeping the version**.
+
+The official patch is a *commit* (`31c0ea7d7ff`, "Avoid state corruption via
+bailout"), not a binary. Applied on top of 8.2.34:
+
+- The **upstream** commit on the 8.2 branch touches 423 files and rewrites
+  the Zend MM allocator: it is not cherry-pickable onto 8.2.34 (conflicts in
+  the core of the engine).
+- The **EOL** branches (7.4, 8.0, 8.1) carry **the same fix reduced to its
+  minimal form** (23 files). That one does apply on top of 8.2.34 with only 3
+  code conflicts, all trivial.
+
+```bash
+docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+python3 verify_backport.py --container php2shell-backport   # → PATCHED
+```
+
+The result: **same `php -v`, same extensions, same ABI.** That is the
+difference between *patching* and *rewriting*.
+
+> ⚠️ **Honest limitation.** The EOL branch backport is a **minimal
+> mitigation**, not the full upstream fix. It permanently disables the
+> `session.upload_progress` callback: that cuts the attack chain, but it also
+> **disables a legitimate feature** (upload progress tracking). If your
+> application uses it, that is an observable behaviour change. Procedure and
+> conflict details: [`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md).
+
+> ⚠️ **Correction (27-Oct-2026, 23:20):** earlier versions of this README
+> claimed PHP 7.4 would be "vulnerable forever". **That is incorrect**: the
+> PHP project published minimal backports for 7.4, 8.0 and 8.1. What is true
+> is that those branches do not receive the regular development cycle, so
+> updating depends on your distro or on applying the backport by hand.
+> Verified against the NCSC-NL advisory and the official advisory
+> `GHSA-6wmf-4rv5-p3rp`.
 
 Partial mitigations (defence in depth, not a substitute for the patch):
 

@@ -448,9 +448,9 @@ The conceptual difference between the two branches, now with the real measured m
 The name comes from the parallelism with **Shellshock** (CVE-2014-6271) and from the delivery vector: by being able to write arbitrary bytes into heap memory, the attacker can forge **any** internal PHP function, not just `system()`. From there:
 
 ```c
-system("id")            // ejecución de comandos
-exec("...")             // idem, ejecución de comandos
-file_get_contents(...)  // lectura de ficheros
+system("id")            // command execution
+exec("...")             // idem, command execution
+file_get_contents(...)  // file reading
 phpinfo()               // fingerprinting
 ```
 
@@ -479,10 +479,10 @@ All the work below was done in an **isolated** environment (Docker, local networ
 ### 5.2 Critical target configuration
 
 ```ini
-; ext/session/php_session.h — requisitos de explotación
-session.upload_progress.enabled = On   ; default de fábrica
+; ext/session/php_session.h — exploitation requirements
+session.upload_progress.enabled = On   ; factory default
 session.upload_progress.name = PHP_SESSION_UPLOAD_PROGRESS
-session.upload_progress.min_freq = 1  ; el atacante debe pausar > 1s
+session.upload_progress.min_freq = 1  ; the attacker must pause > 1s
 session.upload_progress.cleanup = Off
 session.save_path = /tmp/
 memory_limit = 256M
@@ -696,17 +696,17 @@ At shutdown, all long-lived state (backtrace, OPcache, session, error state) is 
 | Verify the real version at runtime, not the package version | **Immediate** |
 
 ```bash
-# Verificar versión en runtime
+# Verify version at runtime
 php -r 'echo PHP_VERSION, PHP_EOL;'
 
-# Apache: reiniciar workers
+# Apache: restart workers
 sudo systemctl restart apache2
 
-# PHP-FPM: recargar todos los pools
-sudo systemctl reload php8.2-fpm   # o restart para guarantee
+# PHP-FPM: reload all pools
+sudo systemctl reload php8.2-fpm   # or restart to be sure
 
-# FPM: recommendation defensiva adicional
-# pm.max_requests=1  (rompe el requisito de "mismo worker")
+# FPM: additional defensive recommendation
+# pm.max_requests=1  (breaks the "same worker" requirement)
 ```
 
 ### 8.2 Partial mitigations (if you cannot update yet)
@@ -714,11 +714,11 @@ sudo systemctl reload php8.2-fpm   # o restart para guarantee
 These are **partial**. Each one covers one arm and leaves the other open.
 
 ```ini
-; Desactivar upload_progress: cierra la rama UAF (CVE-2026-109619)
-; en la mayoría de las instalaciones. Es la mitigación más efectiva.
+; Disable upload_progress: closes the UAF branch (CVE-2026-109619)
+; on most installations. It is the most effective mitigation.
 session.upload_progress.enabled = 0
 
-; En PHP 8.5+: neutralizar la rama de backtraces (CVE-2026-109619)
+; In PHP 8.5+: neutralise the backtraces branch (CVE-2026-109619)
 fatal_error_backtraces = 0
 ```
 
@@ -729,16 +729,16 @@ These are deduced from the real mechanism (OOM → dangling state) and were veri
 empirically in the lab of this work:
 
 ```ini
-; Limita el numero de partes del multipart. Con el limite activo, PHP corta
-; la peticion con "Multipart body parts limit exceeded" ANTES de que se
-; agote la memoria, y la cadena de explotacion no llega a arrancar.
-; Valor por defecto en las imagenes oficiales de PHP: 1500.
-; ATENCION: 0 NO significa "ilimitado" (significa "usa el default").
-; Para desactivar el limite: -1.
+; Limits the number of multipart parts. With the limit active, PHP cuts
+; the request with "Multipart body parts limit exceeded" BEFORE the memory
+; is exhausted, and the exploit chain never starts.
+; Default value in the official PHP images: 1500.
+; WARNING: 0 does NOT mean "unlimited" (it means "use the default").
+; To disable the limit: -1.
 max_multipart_body_parts = 1000
 
-; Limita el numero de ficheros por peticion. Con el default (20), PHP deja
-; de procesar los uploads anidados y el heap nunca se agota.
+; Limits the number of files per request. With the default (20), PHP stops
+; processing the nested uploads and the heap is never exhausted.
 max_file_uploads = 20
 ```
 
@@ -759,11 +759,11 @@ error, according to its own title *"Avoid state corruption via bailout"*). The
 
 ```
 $ ./check_exposure.sh http://127.0.0.1:8080/index.php     # 8.2.34
-[!] VULNERABLE: el servidor agoto su memoria durante el parseo multipart.
+[!] VULNERABLE: the server exhausted its memory during multipart parsing.
     exit=1
 
 $ ./check_exposure.sh http://127.0.0.1:8081/index.php     # 8.2.35
-[+] NO vulnerable: no se disparo el OOM (probablemente PHP parcheado).
+[+] NOT vulnerable: the OOM was not triggered (probably patched PHP).
     exit=0
 ```
 
@@ -790,7 +790,229 @@ sudo systemctl restart apache2
 > - `pm.max_requests=1` breaks the same-worker requirement, useful as an extra layer under FPM.
 > - Do not use `RLIMIT_AS` / `RLIMIT_DATA`.
 
-### 8.3 WAF rules / detection
+### 8.3 The fourth path: patching WITHOUT changing the version
+
+Updating PHP is the right thing to do. But it is not always possible: PECL
+extensions compiled against a specific version, platform dependencies, or
+certifications that pin the stack. In that case there is a route almost
+nobody mentions: **patching the code while keeping the version**.
+
+> The distinction matters. An update changes three things at once: the
+> version number, the available extensions and the ABI. A patch changes
+> **only the code**. That is why a patch does not break dependencies and an
+> update can.
+
+The official patch **is a source code commit**, not a binary. That opens the
+door to applying it on top of any build.
+
+#### 8.3.1 Which commits exist
+
+The fix is titled *"Avoid state corruption via bailout"* and appears in
+**four branches** of `php/php-src`:
+
+| Commit | Branch | Files | Scope |
+|---|---|---|---|
+| `31c0ea7d7ff1d1fccb6492e52dab544011628065` | `PHP-8.2` (upstream) | **423** | Full fix. Rewrites the Zend MM allocator. Tagged `php-8.2.35`. |
+| `01a40e89fb…` | tag `php-8.2.35` | — | Cherry-pick of the above. |
+| `3c832b523e…` | tag `php-8.3.36` | — | Same for 8.3. |
+| `506e87fa7d…` | tag `php-8.4.27` | — | Same for 8.4. |
+| `1d7dec178a094e6e75b229ce22754045f8c6070a` | `PHP-8.1-CVE-2026-109618-109619` | **23** | *"Minimal mitigation for EOL version."* |
+| `82f8f31b16a035c1b67cc253e79f7cc288f4cc20` | `PHP-8.0-CVE-2026-109618-109619` | 23 | Same. |
+| `712e60f9edfd03f0960fc4fc3c2c375f42b90aa2` | `PHP-7.4-CVE-2026-109618-109619` | 23 | Same. |
+
+All with the same message:
+
+```
+Avoid state corruption via bailout
+
+Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)
+```
+
+> ⚠️ **An easy false positive.** In those same EOL branches there are two
+> other commits by Niels Dossche: `ed70b1ea` (*"Fix GHSA-www2-q4fc-65wf"*) and
+> `8b801151` (*"Fix GHSA-h96m-rvf9-jgm2"*). **They are not the PHP2Shell
+> CVEs** — they are DNS rebinding and an array null-deref. The commit we
+> care about is the one mentioning `GHSA-w8hw-w9fx-j79w` and
+> `GHSA-6wmf-4rv5-p3rp`.
+
+#### 8.3.2 Why the upstream commit cannot be backported
+
+Tested with `git cherry-pick --no-commit 31c0ea7d7ff` on top of the
+`php-8.2.34` tag: content conflicts in the **core of the engine**:
+
+```
+CONFLICT (content): Merge conflict in Zend/zend.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.c
+CONFLICT (content): Merge conflict in Zend/zend_alloc.h
+CONFLICT (content): Merge conflict in Zend/zend_attributes.c
+CONFLICT (content): Merge conflict in Zend/zend_builtin_functions.c
+CONFLICT (content): Merge conflict in Zend/zend_execute.c
+CONFLICT (content): Merge conflict in Zend/zend_hash.c
+…
+```
+
+The commit rewrites `Zend/zend_alloc.c` (651 lines), `zend_hash.c`,
+`zend_string.c`, the VM, OPcache and a dozen extensions. **It is not a
+"drop-in" patch.** Resolving it by hand on a production build is exactly the
+kind of operation you do not want to attempt on a Friday.
+
+#### 8.3.3 Why the EOL branch commit does work
+
+The unsupported branches carry **the same fix reduced to its minimal form**,
+written explicitly for them: 23 files, of which **5 are code** and 18 are
+`.phpt` tests. Applied on top of `php-8.2.34` it produces only **3 conflicts
+in real code**:
+
+```
+CONFLICT: Zend/zend_alloc.c
+CONFLICT: ext/opcache/zend_file_cache.c
+CONFLICT: main/rfc1867.c
+CONFLICT: ext/zend_test/tests/observer_bug81430_2.phpt   ← test only
+CONFLICT: ext/zend_test/tests/observer_error_01.phpt      ← test only
+```
+
+None of them is irreversible. And the verified result is that the patched
+PHP **behaves exactly like the official 8.2.35**.
+
+#### 8.3.4 The three conflicts and how they were resolved
+
+**① `Zend/zend_alloc.c`** — two OCC.
+
+*The include.* HEAD (8.2.34) has `#include "zend_mmap.h"`; the patch adds
+`#include "zend_execute.h"`. They are not mutually exclusive: **both are
+kept**.
+
+*The OOM exit.* This is where the substance is:
+
+| | 8.2.34 (HEAD) | patch (EOL branch) |
+|---|---|---|
+| `zend_out_of_memory()` | `exit(1)` | `_exit(1)` |
+
+`exit(1)` runs the `atexit` handlers → flushes buffers → **unwinds through
+the VM**. That unwinding is precisely what corrupts the allocator state: it
+leaves dangling pointers in globals that outlive the worker. `_exit(1)` does
+none of that.
+
+**The patch wins.** But there is a detail that does not surface during the
+`cherry-pick`:
+
+> 8.2.34 **already defines** `zend_out_of_memory()` (line 2792, with `exit(1)`),
+> and the 8.1 branch commit defines it too (line 3112, with `_exit(1)`).
+> On the 8.1 branch there was no prior definition, which is why the patch
+> generates no conflict — **but applying it on top of 8.2.34 produces a
+> redefinition**, and the compiler fails with:
+>
+> ```
+> /…/Zend/zend_alloc.c:2820:37: error: redefinition of 'zend_out_of_memory'
+> ```
+>
+> This **is not a textual conflict**: `git apply` accepts it without
+> complaint and the failure only shows up at compile time. It is the kind of
+> semantic conflict you only see at link time.
+
+Resolution: drop the HEAD definition and keep the patch's.
+
+**② `main/rfc1867.c`** — cosmetic. 8.2.34 already had the `isspace()`
+security fix applied (cast to `unsigned char`); the patch moves that
+`do { value++; } while (isspace(...))` into the new multipart header
+filtering block. The HEAD cast is kept.
+
+**③ `ext/opcache/zend_file_cache.c`** — HEAD uses `bool ok` (C99), the patch
+uses `int ok`. They are not incompatible. `bool` from HEAD is kept and
+`size_t orig_map_ptr_last` from the patch is added, which is
+**indispensable**: it stores the original value of `CG(map_ptr_last)` so it
+can be restored if deserialization fails
+(`zend_accel_pending_ce_cache_discard();
+CG(map_ptr_last) = orig_map_ptr_last;`). It is the mechanism that prevents a
+failure halfway through script loading from leaving the OPcache allocator in
+a half-configured state.
+
+The two conflicts in `.phpt` test files are resolved by keeping HEAD: they
+do not affect the binary.
+
+#### 8.3.5 Measured result
+
+Third target of the laboratory: **PHP 8.2.34 with the patch commit applied
+and recompiled**. Same `php -v`, same extensions, same ABI.
+
+| Target | `php -v` | Patch symbol | OOM | UAF consumed | Verdict |
+|---|---|---|---|---|---|
+| `:8080` | 8.2.34 | 0 | **6/6** | **6/6** (3 SIGSEGV + 3 stale SID) | VULNERABLE |
+| `:8081` | 8.2.35 | 0 | 0/6 | 0/6 | PATCHED |
+| `:8082` | **8.2.34** | **3** | 0/6 | 0/6 | **PATCHED** |
+
+The "patch symbol" indicator is the presence of `zend_mm_safe_error_ex` in
+`/usr/lib/apache2/modules/libphp.so` — the new function the commit
+introduces. In the base image it is 0; in the patched one, 3.
+
+The loaded extensions are identical in the vulnerable and the patched
+target: `mbstring session sodium`.
+
+```bash
+# Build the patched target
+docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+
+# Verify the patch by code, without looking at the version number
+python3 verify_backport.py --container php2shell-backport
+#   session_callback_disabled: True
+#   oom_uses_safe_error: True
+#   VERDICT: PATCHED
+```
+
+#### 8.3.6 Implementation traps
+
+Three things that cost time and that anyone trying to replicate this will
+trip over:
+
+1. **The `mod_php` path.** A build with `--with-apxs2` leaves `libphp.so` in
+   `$PREFIX/libs/`, but the official `php:*-apache` image loads the module
+   from **`/usr/lib/apache2/modules/libphp.so`** (Debian convention).
+   Without overwriting that path, **Apache keeps running the unpatched
+   PHP** and the "patched" target behaves like a vulnerable one. The symptom
+   is silent: everything looks fine until the differential test fails.
+2. **`opcache` is a Zend Extension**, not a regular extension. Loading it
+   with `extension=` fails with *"Invalid library (appears to be a Zend
+   Extension)"*. It needs `zend_extension=opcache.so`.
+3. **Apache, not CLI.** The UAF requires the dangling state to survive
+   between requests **in the same worker**. The built-in `php -S` server is
+   single-process and dies with the crash. With `mpm_prefork` and
+   `MaxRequestWorkers 1` it works.
+
+> 📄 The full procedure, with the three conflicts resolved step by step, is in
+> [`patches/RESOLUTION-NOTES.md`](patches/RESOLUTION-NOTES.md), and the
+> reproducible script in [`patches/apply_backport.sh`](patches/apply_backport.sh).
+
+#### 8.3.7 The honest limitation of this path
+
+The EOL branch backport is a **minimal mitigation**, not the full upstream
+fix. Specifically, it permanently disables the `upload_progress` callback:
+
+```c
+-	if (!PS(rfc1867_enabled)) {
++	if (!PS(rfc1867_enabled) || true) {
+ 		return retval;
+ 	}
+```
+
+That cuts the attack chain (the CVE-2026-109619 branch needs that callback
+to consume the dangling session state), but it **also disables a legitimate
+feature**: upload progress tracking. If your application uses
+`session.upload_progress` for a progress bar, this is an observable
+behaviour change.
+
+**When to use each path:**
+
+| Situation | Recommended path |
+|---|---|
+| PHP 8.2+ with the ability to update | **Update** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12. It is the right thing to do. |
+| PHP 8.2+ that cannot change version (deps, PECL extensions, ABI) | **Backport the commit** (this section). |
+| PHP 7.4 / 8.0 / 8.1 | **Distro patched package** (Sury, Remi, AlmaLinux…) or equivalent backport. |
+| PHP cannot be touched right now | Mitigations: `session.upload_progress.enabled=0`, `max_multipart_body_parts`, `max_file_uploads`, blocking `multipart/form-data` at the web server. |
+
+The golden rule: **patch, do not rewrite**.
+
+### 8.4 WAF rules / detection
 
 Akamai published rule **3000991 v1** ("PHP Remote Code Execution Attack Detected") for its App & API Protector customers, and confirms that its existing command injection rules already mitigate the weaponized payloads.
 
@@ -810,7 +1032,7 @@ Key indicators for custom rules:
   Session ID is too long or contains illegal characters`.
 - `t[]` fields with anomalous size values (≈288 bytes) and high repetition density (spray mechanism described in the public literature).
 
-### 8.4 Post-exploitation — what to look for
+### 8.5 Post-exploitation — what to look for
 
 If a server was exposed:
 
@@ -825,11 +1047,11 @@ If a server was exposed:
 ## 9. Verifying exposure in your fleet
 
 ```bash
-# 1. Sonda de versión via HTTP (sin ejecutar código)
+# 1. Version probe via HTTP (without executing code)
 curl -s "https://tu-sitio/index.php?probe=1"
 
-# 2. Test diferencial completo (el que construimos)
-python3 behavioural_diff.py <host> <port> "ETIQUETA"
+# 2. Full differential test (the one we built)
+python3 behavioural_diff.py <host> <port> "LABEL"
 
 # 3. Escaneo masivo: version de PHP via cabeceras HTTP
 #    (Vercel, Akamai y otros ya exponen la version en cabeceras)
@@ -1724,12 +1946,12 @@ docker build -f Dockerfile.patched -t php2shell-patched:8.2.35 .
 python3 behavioural_diff.py 127.0.0.1 8080 "VULNERABLE"
 python3 behavioural_diff.py 127.0.0.1 8081 "PATCHED"
 
-# --- Target 3: PHP con símbolos + ASLR off, para análisis de bajo nivel ---
-# (compila PHP 8.2.34 desde el código fuente; tarda ~5 minutos)
+# --- Target 3: PHP with symbols + ASLR off, for low-level analysis ---
+# (compiles PHP 8.2.34 from source; takes ~5 minutes)
 docker build -f Dockerfile.rce -t php2shell-rce:8.2.34 .
-./lab-rce.sh     # lo levanta en 8082
+./lab-rce.sh     # brings it up on 8082
 
-# Verificar la base de libphp.so y los offsets en runtime
+# Verify the libphp.so base and the runtime offsets
 curl -s http://127.0.0.1:8082/base.php
 
 # --- Detector/verificador del UAF (con controles negativos) -------------

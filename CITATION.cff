@@ -1,19 +1,21 @@
 cff-version: 1.2.0
 message: "If you use this research, please cite it as below."
-title: "PHP2Shell — Anatomía de CVE-2026-109618 y CVE-2026-109619"
+title: "PHP2Shell — Anatomy of CVE-2026-109618 and CVE-2026-109619"
 abstract: >-
-  Análisis técnico del use-after-free en la capa de sesiones de PHP
-  (session.upload_progress) y de la corrupción de memoria por longjmp() en
-  OOM, con el mecanismo real verificado contra el código fuente de PHP
-  8.2.34, un laboratorio Docker reproducible y un detector de exposición
-  que discrimina de forma fiable entre versiones vulnerables y parcheadas.
+  Technical analysis of the use-after-free in PHP's session layer
+  (session.upload_progress) and of the memory corruption via longjmp() on
+  OOM, with the real mechanism verified against the PHP 8.2.34 source code,
+  a reproducible Docker lab, an exposure detector that reliably discriminates
+  between vulnerable and patched versions, and a verified backport of the
+  official patch that fixes the flaw without changing the PHP version,
+  extensions or ABI.
 type: software
 authors:
   - name: "Santiago López"
     alias: "Santi (Nexo)"
     website: "https://github.com/santilpz28"
-repository-code: "https://github.com/santilpz28/php2shell-pub-en"
-url: "https://github.com/santilpz28/php2shell-pub-en"
+repository-code: "https://github.com/santilpz28/php2shell-pub"
+url: "https://github.com/santilpz28/php2shell-pub"
 license: MIT
 keywords:
   - security
@@ -22,4 +24,6 @@ keywords:
   - php
   - cve
   - memory-corruption
+  - patch
+  - backport
 date-released: "2026-10-27"

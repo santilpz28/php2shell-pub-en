@@ -1,0 +1,23 @@
+########## 8080-vulnerable-8.2.34-sin-parche ##########
+[*] Test diferencial de comportamiento contra 8080-vulnerable-8.2.34-sin-parche
+[*] 1500 uploads anidados (depth=12) -> OOM, y despues
+[*] un Request B con upload_progress al mismo worker.
+
+             Request B -> CRASH (SIGSEGV: UAF consumido)
+             Request B -> 'Session ID is too long' (puntero leido)
+             Request B -> CRASH (SIGSEGV: UAF consumido)
+             Request B -> 'Session ID is too long' (puntero leido)
+             Request B -> CRASH (SIGSEGV: UAF consumido)
+             Request B -> 'Session ID is too long' (puntero leido)
+
+====================================================================
+  OOM disparado:            6/6
+  Request B -> crash:       3
+  Request B -> stale SID:   3
+  Request B -> limpio:      0
+====================================================================
+
+[!] VEREDICTO: 8080-vulnerable-8.2.34-sin-parche es VULNERABLE.
+[!] El estado de sesion colgante se consumio en 6 de 6 rondas.
+[!] Condicion previa de CVE-2026-109619 (RCE sin autenticacion).
+[!] Remedio: actualizar PHP (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12).

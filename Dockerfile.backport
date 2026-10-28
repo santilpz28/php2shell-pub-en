@@ -1,0 +1,111 @@
+# Laboratorio PHP2Shell — imagen con el PARCHE APLICADO encima de 8.2.34
+#
+# QUE DEMUESTRA ESTA IMAGEN (y por que existe)
+# ==============================================
+# El objetivo no es "actualizar PHP a una version moderna". Es lo contrario:
+# partir de la MISMA version (8.2.34) y aplicarle encima el parche oficial,
+# de modo que:
+#
+#   1. El numero de version NO cambia  -> no hay migracion, no hay cambios
+#      de comportamiento de la API, no hay riesgo de incompatibilidad.
+#   2. Las extensiones PECL/PECL compiladas contra 8.2.34 siguen siendo
+#      validas: el ABI interno no cambia en un parche de este tipo.
+#   3. Se demuestra que el parche es un parche DE CODIGO FUENTE, no una
+#      propiedad magica de la version. El numero de version es un proxy;
+#      el commit es la realidad.
+#
+# EL PARCHE
+# =========
+# Commit upstream (rama PHP-8.2):
+#   31c0ea7d7ff1d1fccb6492e52dab544011628065
+#   "Avoid state corruption via bailout" — Arnaud Le Blanc
+#   Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+#   Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)
+#
+# Ese commit upstream es ENORME (423 ficheros, toca el core del allocator de
+# Zend MM) y no aplica limpio sobre 8.2.34: genera conflictos en el nucleo.
+#
+# Para el backport usamos el commit de las RAMAS EOL, que es el mismo fix
+# reducido a su forma minima ("Minimal mitigation for EOL version"):
+#   1d7dec178a094e6e75b229ce22754045f8c6070a  (rama PHP-8.1)
+#   82f8f31b16a035c1b67cc253e79f7cc288f4cc20  (rama PHP-8.0)
+#   712e60f9edfd03f0960fc4fc3c2c375f42b90aa2  (rama PHP-7.4)
+#
+# Ese commit toca 23 ficheros (5 de codigo, 18 de tests) y aplica sobre
+# 8.2.34 con solo 3 conflictos reales, todos resolubles:
+#   Zend/zend_alloc.c            -> abort() vs _exit(1): gana el parche
+#   main/rfc1867.c               -> el cast isspace() ya fixeado en 8.2.34
+#   ext/opcache/zend_file_cache.c -> bool vs int: se conserva bool de HEAD
+#
+# El script de aplicacion esta en patches/apply_backport.sh y es
+# REPRODUCIBLE: vuelve a clonar, volver a parchear, volver a compilar.
+
+FROM php:8.2.34-apache
+
+# Herramientas de build del source de PHP
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      autoconf \
+      bison \
+      re2c \
+      pkg-config \
+      git \
+      apache2-dev \
+      libxml2-dev \
+      libsqlite3-dev \
+      libonig-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY patches/apply_backport.sh /tmp/apply_backport.sh
+COPY patches/php-8.2.34-backport-bailout.patch /tmp/php-8.2.34-backport-bailout.patch
+RUN chmod +x /tmp/apply_backport.sh \
+ && /tmp/apply_backport.sh /usr/local \
+ && rm -rf /tmp/apply_backport.sh /tmp/php-8.2.34-backport-bailout.patch
+
+# El binario de php parcheado debe ser el que se usa. Se comprueba que la
+# version SIGUE SIENDO 8.2.34 (esto es el objetivo: parche sin upgrade) y
+# que el simbolo nuevo del parche esta compilado dentro del binario.
+RUN php -v \
+ && php -r 'echo "session.upload_progress.enabled = ", ini_get("session.upload_progress.enabled"), PHP_EOL;' \
+ && php -r 'echo "mod_php: ", (extension_loaded("session") ? "session OK" : "session FALTA"), PHP_EOL;' \
+ && php -r '$b=file_get_contents("/usr/local/bin/php"); echo "zend_mm_safe_error_ex en el binario CLI: ", (strpos($b,"zend_mm_safe_error_ex")!==false?"SI":"NO"), PHP_EOL;' \
+ && php -r '$b=file_get_contents("/usr/lib/apache2/modules/libphp.so"); echo "zend_mm_safe_error_ex en libphp.so: ", (strpos($b,"zend_mm_safe_error_ex")!==false?"SI":"NO"), PHP_EOL;' \
+ && ls -la /usr/lib/apache2/modules/libphp.so \
+ && ls -la /usr/local/lib/php/extensions/*/
+
+RUN docker-php-ext-install session \
+ && a2enmod headers \
+ && mkdir -p /tmp/upcache \
+ && chmod 777 /tmp/upcache
+
+# Configuracion IDENTICA a la imagen vulnerable (Dockerfile), para que el
+# test diferencial de comportamiento (behavioural_diff.py) sea comparativo:
+# lo unico que cambia entre las dos imagenes es el parche.
+RUN { \
+      echo 'session.upload_progress.enabled=On'; \
+      echo 'session.upload_progress.name=PHP_SESSION_UPLOAD_PROGRESS'; \
+      echo 'session.upload_progress.min_freq=1'; \
+      echo 'session.upload_progress.cleanup=On'; \
+      echo 'session.save_path=/tmp/'; \
+      echo 'max_multipart_body_parts=-1'; \
+      echo 'max_file_uploads=1000'; \
+      echo 'memory_limit=32M'; \
+      echo 'upload_progress.enabled=On'; \
+      echo 'upload_progress.cleanup=Off'; \
+    } > /usr/local/etc/php/conf.d/zz-php2shell-lab.ini
+
+RUN rm -f /usr/local/etc/php/conf.d/docker-php-ext-opcache.ini || true
+
+RUN sed -i 's#php_admin_value\[upload_progress.enabled\].*##' /etc/apache2/conf-enabled/docker-php.conf 2>/dev/null || true
+
+# Un SOLO worker de Apache (misma razon que en la imagen vulnerable):
+# el estado colgante vive en la memoria del proceso, asi que el Request B
+# tiene que ser atendido por el MISMO worker que atendio el Request A.
+RUN { \
+      echo 'StartServers 1'; \
+      echo 'MinSpareServers 1'; \
+      echo 'MaxSpareServers 1'; \
+      echo 'MaxRequestWorkers 1'; \
+    } > /etc/apache2/conf-enabled/zz-php2shell-prefork.conf
+
+EXPOSE 80

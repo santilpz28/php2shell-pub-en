@@ -1,33 +1,63 @@
 services:
+  # ---------------------------------------------------------------------
+  # Target VULNERABLE: PHP 8.2.34 sin parche.
+  # ---------------------------------------------------------------------
   php-vuln:
-    image: php:8.2.34-cli
+    image: php2shell-vuln:8.2.34
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: php2shell-vuln
-    working_dir: /app
     volumes:
-      - ./web:/app
-    command: >
-      sh -c "php -d session.upload_progress.enabled=On
-             -d session.upload_progress.cleanup=On
-             -d memory_limit=256M
-             -S 0.0.0.0:8080 -t /app" &
+      - ./web:/var/www/html
+    ports:
+      - "8080:80"
     healthcheck:
-      test: ["CMD", "php", "-r", "echo 1;"]
+      test: ["CMD-SHELL", "php -r 'echo 1;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
+
+  # ---------------------------------------------------------------------
+  # Target PARCHEADO POR CAMBIO DE VERSION: PHP 8.2.35 oficial.
+  # Referencia: demuestra que el fix publicado funciona.
+  # ---------------------------------------------------------------------
   php-patched:
-    image: php:8.2.35-cli
+    image: php2shell-patched:8.2.35
+    build:
+      context: .
+      dockerfile: Dockerfile.patched
     container_name: php2shell-patched
-    working_dir: /app
     volumes:
-      - ./web:/app
-    command: >
-      sh -c "php -d session.upload_progress.enabled=On
-             -d session.upload_progress.cleanup=On
-             -d memory_limit=256M
-             -S 0.0.0.0:8081 -t /app" &
+      - ./web:/var/www/html
+    ports:
+      - "8081:80"
     healthcheck:
-      test: ["CMD", "php", "-r", "echo 1;"]
+      test: ["CMD-SHELL", "php -r 'echo 1;' >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------
+  # Target PARCHEADO SIN CAMBIAR DE VERSION: PHP 8.2.34 + commit de parche.
+  # Mismo numero de version, mismas extensiones, mismo ABI. Solo cambia
+  # el codigo. Esta es la variante que NO rompe dependencias.
+  #
+  # Construir con:
+  #   docker build -f Dockerfile.backport -t php2shell-backport:8.2.34 .
+  # ---------------------------------------------------------------------
+  php-backport:
+    image: php2shell-backport:8.2.34
+    build:
+      context: .
+      dockerfile: Dockerfile.backport
+    container_name: php2shell-backport
+    volumes:
+      - ./web:/var/www/html
+    ports:
+      - "8082:80"
+    healthcheck:
+      test: ["CMD-SHELL", "php -r 'echo 1;' >/dev/null 2>&1 || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5

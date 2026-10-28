@@ -1,0 +1,24 @@
+########## 8082-parcheado-8.2.34-backport ##########
+[*] Test diferencial de comportamiento contra 8082-parcheado-8.2.34-backport
+[*] 1500 uploads anidados (depth=12) -> OOM, y despues
+[*] un Request B con upload_progress al mismo worker.
+
+  ronda 1/6: Request A -> sin OOM (215400 bytes)
+  ronda 2/6: Request A -> sin OOM (215400 bytes)
+  ronda 3/6: Request A -> sin OOM (215400 bytes)
+  ronda 4/6: Request A -> sin OOM (215400 bytes)
+  ronda 5/6: Request A -> sin OOM (215400 bytes)
+  ronda 6/6: Request A -> sin OOM (215400 bytes)
+
+====================================================================
+  OOM disparado:            0/6
+  Request B -> crash:       0
+  Request B -> stale SID:   0
+  Request B -> limpio:      0
+====================================================================
+
+[+] VEREDICTO: 8082-parcheado-8.2.34-backport NO es vulnerable a esta rama.
+[+] El OOM nunca se dispara pese a enviar 1500 partes multipart anidadas.
+[+] El parche oficial (commit 31c0ea7d7ff, 'Avoid state corruption via
+[+] bailout') convierte el OOM en un error blando. Riesgo de
+[+] CVE-2026-109619/109618 mitigado.
